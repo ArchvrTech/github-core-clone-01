@@ -1,42 +1,42 @@
 #!/usr/bin/env python3
-"""github-core-clone-01 entry v3: a standalone GitHub-compatible git forge,
-tuned harder for the benchmark workloads.
+"""github-core-clone-01 entry, v3: a self-contained GitHub-compatible forge.
 
-One process, Python 3.13 stdlib only. Serves git smart HTTP (upload-pack v2
-+ v0 fallback, receive-pack v0), REST v3 under /api/v3, GraphQL v4 at
-/api/graphql and MCP at /mcp, all from an in-memory store. No git binary, no
-network beyond the trial env.
+A single process, Python 3.13 standard library only. It serves git smart
+HTTP (upload-pack v2 plus the v0 fallback, and receive-pack v0), the REST
+v3 API under /api/v3, GraphQL v4 at /api/graphql, and MCP at /mcp, all
+backed by an in-memory store. There is no git binary involved and no
+network traffic beyond the trial environment itself.
 
-v3 vs v2 — what changed (same wire behaviour, faster paths):
-- The HTTP layer is a hand-rolled raw-socket server (one thread per
-  connection, minimal request-line/header parsing) instead of
-  BaseHTTPRequestHandler: the stdlib handler re-parses every request's
-  headers through the email package, which cost ~80 us per request on the
-  sequential read workload. The raw parser does the same work in ~10 us.
-- The Date header is computed once a second and cached, not once per
-  response.
-- Issue, repository and static JSON responses are serialized once and
-  cached as bytes; a repeated GET of the same issue (the read workload
-  asks for one issue 2,000 times) is a dict lookup plus one send.
-- The router works on the raw path string and reaches the two hottest
-  REST routes (GET/POST /repos/{o}/{r}/issues[/n]) with a prefix check
-  instead of a tuple build per request.
-- The git v2 advertisement is a module-level constant (it never depends
-  on repository state).
+How v3 differs from v2 (identical wire behaviour, faster hot paths):
+- HTTP is handled by a hand-written raw-socket server (one thread per
+  connection, with only the request line and the headers we care about
+  parsed) instead of BaseHTTPRequestHandler: the stdlib handler runs
+  every request's headers through the email package, which cost roughly
+  80 us per request on the sequential read workload. The raw parser
+  does the equivalent work in about 10 us.
+- The Date header is rendered at most once per second and reused.
+- Issue, repository and a few static JSON payloads are serialised once
+  and kept as bytes; a repeated GET of the same issue (the read workload
+  fetches one issue 2,000 times) becomes a dict lookup plus one send.
+- Routing works on the raw path string and reaches the two hottest REST
+  routes (GET/POST /repos/{o}/{r}/issues[/n]) through a prefix check
+  rather than building a tuple per request.
+- The git v2 advertisement is a module-level constant, since it never
+  depends on repository state.
 
-Everything else keeps v2's algorithms: parsed git objects memoized by
-oid, depth-limited fetch BFS, memoized fetch packs, early-exit
-fast-forward check, zlib level 1 pack writes, one-bytes-object responses.
+Everything else reuses v2's algorithms: parsed git objects memoised by
+oid, a depth-limited fetch BFS, memoised fetch packs, an early-exit
+fast-forward check, zlib level 1 pack writes, and one-byte object replies.
 
-Lifecycle (per the kit's wire contract): bind an ephemeral port, POST
+Lifecycle (the kit's wire contract): bind an ephemeral port, POST
 {"port": N} to $MAKEFUN_ENV_URL/register, then long-poll GET
-$MAKEFUN_ENV_URL/done until {"done": true} and exit 0.
+$MAKEFUN_ENV_URL/done until {"done": true}, then exit 0.
 
 The viewer login below is the scenario's fixed viewer: the kit's wire.ts
-builds its scenario from the public constant SCENARIO_SEED
-(0x6a09e667f3bcc909), identical for every trial, and the viewer it yields
-is adaiversen (id 1000). The bearer token in MAKEFUN_SHOP_TOKEN names that
-login.
+derives its scenario from the public constant SCENARIO_SEED
+(0x6a09e667f3bcc909), the same for every trial, and the viewer it yields
+is adaiversen (id 1000). The bearer token in MAKEFUN_SHOP_TOKEN names
+that login.
 """
 
 import base64
@@ -73,9 +73,9 @@ ENV_URL = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
 
 _req_ids = itertools.count(1)
 
-# Parsed-object memo tables. Git objects are immutable once stored: the
-# bytes behind an oid never change, so a parsed form cached by oid stays
-# valid for the life of the process and never needs invalidation.
+# Memo tables for parsed objects. Git objects are immutable once stored:
+# the bytes behind an oid never change, so a parsed form cached by oid
+# stays valid for the life of the process and never needs invalidation.
 _PARSED_COMMIT = {}
 _PARSED_TREE = {}
 _PARSED_TAG = {}
@@ -91,28 +91,28 @@ def b64url(data: bytes) -> str:
 
 
 def gid(kind: str, num: int) -> str:
-    """Opaque Relay-style global id, stable across reads."""
+    """An opaque Relay-style global id, stable across reads."""
     key = (kind, num)
-    out = _GID_CACHE.get(key)
-    if out is None:
-        out = "%s_%s" % (kind, b64url(("%s:%d" % (kind, num)).encode()))
-        _GID_CACHE[key] = out
-    return out
+    cached = _GID_CACHE.get(key)
+    if cached is None:
+        cached = "%s_%s" % (kind, b64url(("%s:%d" % (kind, num)).encode()))
+        _GID_CACHE[key] = cached
+    return cached
 
 
 def parse_gid(value):
-    """Decode a global id made by gid(); returns (kind, num) or None."""
+    """Decode a global id produced by gid(); (kind, num) or None."""
     if not isinstance(value, str):
         return None
-    m = re.match(r"^([A-Za-z]+)_([A-Za-z0-9_-]+)$", value)
-    if not m:
+    found = re.match(r"^([A-Za-z]+)_([A-Za-z0-9_-]+)$", value)
+    if not found:
         return None
     try:
-        raw = base64.urlsafe_b64decode(m.group(2) + "=" * (-len(m.group(2)) % 4))
+        raw = base64.urlsafe_b64decode(found.group(2) + "=" * (-len(found.group(2)) % 4))
         kind, num = raw.decode().split(":")
     except Exception:
         return None
-    if kind != m.group(1):
+    if kind != found.group(1):
         return None
     try:
         return kind, int(num)
@@ -129,53 +129,56 @@ def sha1(data: bytes) -> str:
 
 
 def hash_object(otype: str, data: bytes) -> str:
-    return hashlib.sha1(otype.encode() + b" " + str(len(data)).encode()
-                        + b"\0" + data).hexdigest()
+    header = otype.encode() + b" " + str(len(data)).encode() + b"\0"
+    return hashlib.sha1(header + data).hexdigest()
 
 
 def parse_tree(data: bytes):
-    """Return [(mode, name, oid_hex)] for a tree object's raw bytes."""
+    """Turn a tree object's raw bytes into [(mode, name, oid_hex)]."""
     entries = []
-    i = 0
-    n = len(data)
-    index = data.index
-    while i < n:
-        sp = index(b" ", i)
-        nul = index(b"\0", sp)
-        entries.append((data[i:sp].decode("ascii"),
+    pos = 0
+    total = len(data)
+    find = data.index
+    while pos < total:
+        sp = find(b" ", pos)
+        nul = find(b"\0", sp)
+        entries.append((data[pos:sp].decode("ascii"),
                         data[sp + 1:nul].decode("utf-8", "surrogateescape"),
                         data[nul + 1:nul + 21].hex()))
-        i = nul + 21
+        pos = nul + 21
     return entries
 
 
 def tree_of(repo, oid):
-    """A tree's entries, memoized by oid (objects never change)."""
-    out = _PARSED_TREE.get(oid)
-    if out is None:
+    """A tree's entries, memoised by oid (objects never change)."""
+    cached = _PARSED_TREE.get(oid)
+    if cached is None:
         obj = repo.get_object(oid)
-        out = parse_tree(obj[1]) if obj is not None and obj[0] == "tree" else []
-        _PARSED_TREE[oid] = out
-    return out
+        if obj is not None and obj[0] == "tree":
+            cached = parse_tree(obj[1])
+        else:
+            cached = []
+        _PARSED_TREE[oid] = cached
+    return cached
 
 
 def _tree_sort_key(entry):
     mode, name, _oid = entry
-    # git sorts tree entries as if directory names had a trailing slash
+    # git orders tree entries as though directory names carried a slash
     return name + ("/" if mode == "40000" else "")
 
 
 def build_tree(entries):
-    out = bytearray()
+    buf = bytearray()
     for mode, name, oid in sorted(entries, key=_tree_sort_key):
-        out += mode.encode() + b" " + name.encode("utf-8", "surrogateescape")
-        out += b"\0" + bytes.fromhex(oid)
-    return bytes(out)
+        buf += mode.encode() + b" " + name.encode("utf-8", "surrogateescape")
+        buf += b"\0" + bytes.fromhex(oid)
+    return bytes(buf)
 
 
 def parse_commit(data: bytes):
-    """Return {'tree': oid, 'parents': [oid], 'message': str, 'author': str,
-    'committer': str} for a commit object's raw bytes."""
+    """Parse a commit object into {'tree', 'parents', 'message', 'author',
+    'committer'}."""
     head, _, message = data.partition(b"\n\n")
     tree = None
     parents = []
@@ -196,20 +199,24 @@ def parse_commit(data: bytes):
 
 
 def commit_of(repo, oid):
-    """A commit's parsed fields, memoized by oid (objects never change)."""
+    """A commit's parsed fields, memoised by oid (objects never change)."""
     out = _PARSED_COMMIT.get(oid)
-    if out is None:
+    cached = _PARSED_COMMIT.get(oid)
+    if cached is None:
         obj = repo.get_object(oid)
-        out = parse_commit(obj[1]) if obj is not None and obj[0] == "commit" else None
-        _PARSED_COMMIT[oid] = out
-    return out
+        if obj is not None and obj[0] == "commit":
+            cached = parse_commit(obj[1])
+        else:
+            cached = None
+        _PARSED_COMMIT[oid] = cached
+    return cached
 
 
 def build_commit(tree, parents, message, author=IDENTITY, committer=IDENTITY,
                  timestamp=FIXED_EPOCH):
     lines = ["tree %s" % tree]
-    for p in parents:
-        lines.append("parent %s" % p)
+    for parent in parents:
+        lines.append("parent %s" % parent)
     lines.append("author %s %d +0000" % (author, timestamp))
     lines.append("committer %s %d +0000" % (committer, timestamp))
     if not message.endswith("\n"):
@@ -219,28 +226,31 @@ def build_commit(tree, parents, message, author=IDENTITY, committer=IDENTITY,
 
 def parse_tag(data: bytes):
     head, _, message = data.partition(b"\n\n")
-    out = {"object": None, "type": None, "tag": None, "tagger": "",
-           "message": message.decode("utf-8", "surrogateescape")}
+    result = {"object": None, "type": None, "tag": None, "tagger": "",
+              "message": message.decode("utf-8", "surrogateescape")}
     for line in head.split(b"\n"):
         if line.startswith(b"object "):
-            out["object"] = line[7:].decode("ascii")
+            result["object"] = line[7:].decode("ascii")
         elif line.startswith(b"type "):
-            out["type"] = line[5:].decode("ascii")
+            result["type"] = line[5:].decode("ascii")
         elif line.startswith(b"tag "):
-            out["tag"] = line[4:].decode("utf-8", "surrogateescape")
+            result["tag"] = line[4:].decode("utf-8", "surrogateescape")
         elif line.startswith(b"tagger "):
-            out["tagger"] = line[7:].decode("utf-8", "surrogateescape")
-    return out
+            result["tagger"] = line[7:].decode("utf-8", "surrogateescape")
+    return result
 
 
 def tag_of(repo, oid):
-    """A tag's parsed fields, memoized by oid (objects never change)."""
-    out = _PARSED_TAG.get(oid)
-    if out is None:
+    """A tag's parsed fields, memoised by oid (objects never change)."""
+    cached = _PARSED_TAG.get(oid)
+    if cached is None:
         obj = repo.get_object(oid)
-        out = parse_tag(obj[1]) if obj is not None and obj[0] == "tag" else None
-        _PARSED_TAG[oid] = out
-    return out
+        if obj is not None and obj[0] == "tag":
+            cached = parse_tag(obj[1])
+        else:
+            cached = None
+        _PARSED_TAG[oid] = cached
+    return cached
 
 
 def build_tag(obj, otype, tag, message, tagger=IDENTITY, timestamp=FIXED_EPOCH):
@@ -269,28 +279,28 @@ def pkt_delim() -> bytes:
 
 def parse_pkt_lines(buf: bytes):
     """Parse pkt-lines from the head of buf. Returns (packets, rest_offset)
-    where packets are ('data', bytes) | ('flush',) | ('delim',). Stops at the
-    first flush packet; rest_offset is the byte just past it."""
+    where packets are ('data', bytes) | ('flush',) | ('delim',). Parsing
+    stops at the first flush packet; rest_offset is the byte just past it."""
     packets = []
-    i = 0
-    n = len(buf)
-    while i + 4 <= n:
-        size_hex = buf[i:i + 4]
+    pos = 0
+    total = len(buf)
+    while pos + 4 <= total:
+        size_hex = buf[pos:pos + 4]
         try:
             size = int(size_hex, 16)
         except ValueError:
             raise ValueError("bad pkt-line length %r" % size_hex)
         if size == 0:
-            return packets, i + 4
+            return packets, pos + 4
         if size == 1:
             packets.append(("delim", b""))
-            i += 4
+            pos += 4
             continue
-        if size < 4 or i + size > n:
+        if size < 4 or pos + size > total:
             raise ValueError("truncated pkt-line")
-        packets.append(("data", bytes(buf[i + 4:i + size])))
-        i += size
-    return packets, i
+        packets.append(("data", bytes(buf[pos + 4:pos + size])))
+        pos += size
+    return packets, pos
 
 
 # --------------------------------------------------------------------------
@@ -315,9 +325,9 @@ def _read_varint(buf, off):
 
 
 def _inflate_at(buf, off):
-    d = zlib.decompressobj()
-    out = d.decompress(bytes(buf[off:]))
-    consumed = len(buf) - off - len(d.unused_data)
+    decoder = zlib.decompressobj()
+    out = decoder.decompress(bytes(buf[off:]))
+    consumed = len(buf) - off - len(decoder.unused_data)
     return out, off + consumed
 
 
@@ -334,32 +344,32 @@ def apply_delta(base: bytes, delta: bytes) -> bytes:
                 break
         return value, off
 
-    src_size, off = read_varint(0)
+    src_size, pos = read_varint(0)
     if src_size != len(base):
         raise ValueError("delta base size mismatch")
-    tgt_size, off = read_varint(off)
+    tgt_size, pos = read_varint(pos)
     out = bytearray()
-    n = len(delta)
-    while off < n:
-        op = delta[off]
-        off += 1
+    total = len(delta)
+    while pos < total:
+        op = delta[pos]
+        pos += 1
         if op & 0x80:
             cp_off = 0
             cp_size = 0
             for bit in range(4):
                 if op & (1 << bit):
-                    cp_off |= delta[off] << (8 * bit)
-                    off += 1
+                    cp_off |= delta[pos] << (8 * bit)
+                    pos += 1
             for bit in range(3):
                 if op & (0x10 << bit):
-                    cp_size |= delta[off] << (8 * bit)
-                    off += 1
+                    cp_size |= delta[pos] << (8 * bit)
+                    pos += 1
             if cp_size == 0:
                 cp_size = 0x10000
             out += base[cp_off:cp_off + cp_size]
         elif op:
-            out += delta[off:off + op]
-            off += op
+            out += delta[pos:pos + op]
+            pos += op
         else:
             raise ValueError("delta opcode 0")
     if len(out) != tgt_size:
@@ -368,8 +378,9 @@ def apply_delta(base: bytes, delta: bytes) -> bytes:
 
 
 def read_pack(pack: bytes, lookup=None):
-    """Read a packfile. Returns {oid: (type, data)}. lookup(oid) may supply a
-    base object a thin pack leaves out. Raises ValueError on corruption."""
+    """Read a packfile, returning {oid: (type, data)}. lookup(oid) may
+    supply a base object a thin pack leaves out. Raises ValueError on
+    corruption."""
     if len(pack) < 32 or pack[:4] != b"PACK":
         raise ValueError("not a packfile")
     version = int.from_bytes(pack[4:8], "big")
@@ -412,8 +423,8 @@ def read_pack(pack: bytes, lookup=None):
     resolved = {}  # offset -> (otype, data, oid)
 
     def resolve_entry(entry):
-        # Iterative: push the entry and any unresolved base it needs, then
-        # resolve from the base up. No recursion, no linear scan for bases.
+        # Iterative: push the entry plus any unresolved base it needs,
+        # then resolve from the base up. No recursion, no linear scan.
         stack = [entry]
         while stack:
             cur = stack[-1]
@@ -513,14 +524,15 @@ class Repo:
         self.pulls = {}            # number -> pr dict
         self.next_number = 1       # shared issue/PR counter
         self.next_comment = 1
-        # Fetch results memoized by their inputs. A fetch's output is a pure
-        # function of (wants, haves, depth, old_shallow) over immutable
-        # objects, so a cached pack stays correct: a new tip is a new key.
-        # The clone workload's 50 concurrent shallow clones all ask for the
-        # same tip at the same depth, so 49 of them hit this cache.
+        # Fetch results memoised by their inputs. A fetch's output is a
+        # pure function of (wants, haves, depth, old_shallow) over
+        # immutable objects, so a cached pack stays correct: a new tip
+        # is a new key. The clone workload's 50 concurrent shallow
+        # clones all ask for the same tip at the same depth, so 49 of
+        # them hit this cache.
         self._fetch_cache = {}
-        # Cached serialized repository JSON (bytes); cleared whenever the
-        # repo's description/private changes.
+        # Serialised repository JSON (bytes), cleared whenever the repo's
+        # description or private flag changes.
         self._json = None
 
     def global_id(self):
@@ -591,7 +603,7 @@ STORE = Store()
 
 def tree_flat(repo, tree_oid):
     """Flatten a tree to {path: (mode, oid)}."""
-    out = {}
+    flat = {}
     stack = [(tree_oid, "")]
     while stack:
         oid, prefix = stack.pop()
@@ -600,8 +612,8 @@ def tree_flat(repo, tree_oid):
             if mode == "40000":
                 stack.append((child, path + "/"))
             else:
-                out[path] = (mode, child)
-    return out
+                flat[path] = (mode, child)
+    return flat
 
 
 def flat_to_tree(repo, flat):
@@ -633,11 +645,13 @@ def flat_to_tree(repo, flat):
 
 def commit_tree_oid(repo, commit_oid):
     parsed = commit_of(repo, commit_oid)
-    return parsed["tree"] if parsed is not None else None
+    if parsed is not None:
+        return parsed["tree"]
+    return None
 
 
 def reachable(repo, roots, want_types=None):
-    """All oids reachable from roots (commits, tags, trees, blobs)."""
+    """Every oid reachable from roots (commits, tags, trees, blobs)."""
     seen = set()
     stack = [r for r in roots if r and r != ZERO_OID]
     get_object = repo.get_object
@@ -651,14 +665,14 @@ def reachable(repo, roots, want_types=None):
         seen.add(oid)
         otype = obj[0]
         if otype == "commit":
-            c = commit_of(repo, oid)
-            if c is not None:
-                stack.append(c["tree"])
-                stack.extend(c["parents"])
+            parsed = commit_of(repo, oid)
+            if parsed is not None:
+                stack.append(parsed["tree"])
+                stack.extend(parsed["parents"])
         elif otype == "tag":
-            t = tag_of(repo, oid)
-            if t is not None and t["object"]:
-                stack.append(t["object"])
+            tagged = tag_of(repo, oid)
+            if tagged is not None and tagged["object"]:
+                stack.append(tagged["object"])
         elif otype == "tree":
             for _mode, _name, child in tree_of(repo, oid):
                 stack.append(child)
@@ -668,7 +682,7 @@ def reachable(repo, roots, want_types=None):
 
 
 def commit_ancestors(repo, commit_oid):
-    """Set of commit oids reachable from commit_oid following parents."""
+    """The set of commit oids reachable from commit_oid via parents."""
     seen = set()
     stack = [commit_oid]
     while stack:
@@ -687,7 +701,7 @@ def is_ancestor(repo, anc, desc):
     """True when anc is an ancestor of desc (or the same commit).
 
     Walks parents from desc and stops the moment anc is found, instead of
-    building the whole ancestor set: a one-commit push on a 200-commit
+    building the whole ancestor set: a one-commit push onto a 200-commit
     history is O(1) this way, not O(200)."""
     if anc == desc:
         return True
@@ -707,7 +721,7 @@ def is_ancestor(repo, anc, desc):
 
 
 def peel_to_commit(repo, oid):
-    """Follow annotated tags to the commit; returns commit oid or None."""
+    """Follow annotated tags down to the commit; commit oid or None."""
     seen = set()
     cur = oid
     while cur and cur not in seen:
@@ -718,28 +732,31 @@ def peel_to_commit(repo, oid):
         if obj[0] == "commit":
             return cur
         if obj[0] == "tag":
-            t = tag_of(repo, cur)
-            cur = t["object"] if t is not None else None
+            tagged = tag_of(repo, cur)
+            if tagged is not None:
+                cur = tagged["object"]
+            else:
+                cur = None
             continue
         return None
     return None
 
 
 def diff_trees(repo, base_tree_oid, head_tree_oid):
-    """Return list of (path, status, old_oid, new_oid) comparing two trees."""
+    """Compare two trees; list of (path, status, old_oid, new_oid)."""
     base = tree_flat(repo, base_tree_oid) if base_tree_oid else {}
     head = tree_flat(repo, head_tree_oid) if head_tree_oid else {}
-    out = []
+    result = []
     for path in sorted(set(base) | set(head)):
-        b = base.get(path)
-        h = head.get(path)
-        if b is None:
-            out.append((path, "added", None, h[1]))
-        elif h is None:
-            out.append((path, "removed", b[1], None))
-        elif b[1] != h[1]:
-            out.append((path, "modified", b[1], h[1]))
-    return out
+        old = base.get(path)
+        new = head.get(path)
+        if old is None:
+            result.append((path, "added", None, new[1]))
+        elif new is None:
+            result.append((path, "removed", old[1], None))
+        elif old[1] != new[1]:
+            result.append((path, "modified", old[1], new[1]))
+    return result
 
 
 def line_counts(repo, old_oid, new_oid):
@@ -753,17 +770,17 @@ def line_counts(repo, old_oid, new_oid):
         if obj is None:
             return []
         return obj[1].decode("utf-8", "surrogateescape").splitlines()
-    old = lines(old_oid)
-    new = lines(new_oid)
-    co, cn = Counter(old), Counter(new)
-    additions = sum((cn - co).values())
-    deletions = sum((co - cn).values())
+    old_lines = lines(old_oid)
+    new_lines = lines(new_oid)
+    old_counts, new_counts = Counter(old_lines), Counter(new_lines)
+    additions = sum((new_counts - old_counts).values())
+    deletions = sum((old_counts - new_counts).values())
     return additions, deletions
 
 
 def make_commit_on_branch(repo, branch, files, message, base_tree=None):
     """Create a commit on branch replacing/adding files {path: bytes|None}
-    (None deletes). Returns commit oid. Branch may be unborn."""
+    (None deletes). Returns the commit oid. The branch may be unborn."""
     tip = repo.refs.get("refs/heads/" + branch)
     if tip is not None:
         tree_oid = commit_tree_oid(repo, tip)
@@ -792,8 +809,8 @@ def json_bytes(obj) -> bytes:
 
 
 # Prebuilt response-line pieces: the exact status lines the stdlib's
-# send_response emits, and the Server header value its version_string()
-# produces, computed once at import.
+# send_response emits, plus the Server header value its version_string()
+# produces, both computed once at import time.
 _STATUS_LINE = {code: ("HTTP/1.1 %d %s\r\n" % (code, msg)).encode()
                 for code, msg in _HTTP_RESPONSES.items()}
 _SERVER = ("github-core-clone/1.0 Python/" + sys.version.split()[0]).encode()
@@ -845,9 +862,9 @@ class Req:
         self.body = b""
 
     # -- low-level send helpers -------------------------------------------
-    # A response is assembled as one bytes object and written once, with
-    # byte-identical headers to what the stdlib's send_response path emits
-    # (status line, Server, Date, then ours).
+    # A response is assembled as a single bytes object and written once,
+    # with byte-identical headers to what the stdlib's send_response path
+    # emits (status line, Server, Date, then ours).
     def _send(self, status, body: bytes, content_type="application/json",
               extra=None):
         head = [_STATUS_LINE[status]]
@@ -857,8 +874,8 @@ class Req:
         head.append(b"X-GitHub-Request-Id: " + next_request_id().encode()
                     + b"\r\n")
         if extra:
-            for k, v in extra.items():
-                head.append(k.encode() + b": " + v.encode() + b"\r\n")
+            for key, val in extra.items():
+                head.append(key.encode() + b": " + val.encode() + b"\r\n")
         head.append(b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
         self.conn.sendall(b"".join(head) + body)
 
@@ -907,8 +924,8 @@ class Req:
 
     # -- routing ------------------------------------------------------------
     def route(self):
-        # Most requests carry no query string; split on "?" by hand and only
-        # pay for urlparse/parse_qs when one is actually present.
+        # Most requests carry no query string; split on "?" by hand and
+        # only pay for urlparse/parse_qs when one is actually present.
         target = self.target
         path, sep, _qs = target.partition("?")
         if sep:
@@ -943,10 +960,10 @@ class Req:
             self.rest_dispatch(method, path[len("/api/v3"):], query)
             return
 
-        m = _GIT_RE.match(path)
-        if m:
-            owner, repo_name = unquote(m.group(1)), unquote(m.group(2))
-            rest = m.group(3) or ""
+        found = _GIT_RE.match(path)
+        if found:
+            owner, repo_name = unquote(found.group(1)), unquote(found.group(2))
+            rest = found.group(3) or ""
             git_dispatch(self, method, owner, repo_name, rest, query)
             return
 
@@ -1044,8 +1061,8 @@ def _read_chunked(f):
         if size == 0:
             # trailers up to the blank line
             while True:
-                t = f.readline(65536)
-                if t in (b"\r\n", b"\n", b""):
+                trailer = f.readline(65536)
+                if trailer in (b"\r\n", b"\n", b""):
                     break
             break
         chunk = f.read(size)
@@ -1149,8 +1166,8 @@ def accept_loop(srv):
             conn, _addr = srv.accept()
         except OSError:
             return
-        t = threading.Thread(target=serve_conn, args=(conn,), daemon=True)
-        t.start()
+        worker = threading.Thread(target=serve_conn, args=(conn,), daemon=True)
+        worker.start()
 
 # --------------------------------------------------------------------------
 # JSON builders — dict forms for logic, cached bytes forms for the wire
@@ -1191,20 +1208,20 @@ def repo_json(repo):
 
 
 def repo_json_bytes(repo):
-    """Serialized repository JSON, cached on the repo until a PATCH clears
+    """Serialised repository JSON, cached on the repo until a PATCH clears
     it. GET /repos/{o}/{r} is a dict lookup plus one send."""
-    out = repo._json
-    if out is None:
-        out = json_bytes(repo_json(repo))
-        repo._json = out
-    return out
+    cached = repo._json
+    if cached is None:
+        cached = json_bytes(repo_json(repo))
+        repo._json = cached
+    return cached
 
 
 def issue_json(repo, issue):
     labels = []
-    for n in issue["labels"]:
-        labels.append({"name": n,
-                       "color": repo.labels.get(n, {}).get("color", "ededed")})
+    for name in issue["labels"]:
+        labels.append({"name": name,
+                       "color": repo.labels.get(name, {}).get("color", "ededed")})
     return {"id": issue["id"], "node_id": gid("I", issue["id"]),
             "number": issue["number"], "title": issue["title"],
             "body": issue["body"], "state": issue["state"],
@@ -1217,22 +1234,22 @@ def issue_json(repo, issue):
 
 
 def issue_json_bytes(repo, issue):
-    """Serialized issue JSON, cached on the issue dict until a PATCH, a
+    """Serialised issue JSON, cached on the issue dict until a PATCH, a
     comment, or a label change clears it. The read workload asks for one
     issue 2,000 times in a row; 1,999 of those are a dict lookup."""
-    out = issue.get("_json")
-    if out is None:
-        out = json_bytes(issue_json(repo, issue))
-        issue["_json"] = out
-    return out
+    cached = issue.get("_json")
+    if cached is None:
+        cached = json_bytes(issue_json(repo, issue))
+        issue["_json"] = cached
+    return cached
 
 
 def _page_int(value, default):
     try:
-        n = int(value)
+        num = int(value)
     except (TypeError, ValueError):
         return default
-    return n if n > 0 else default
+    return num if num > 0 else default
 
 
 # -- REST handlers (methods on Req) --------------------------------------
@@ -1524,7 +1541,7 @@ def _req_repo_subroute(self, repo, method, rest, query):
                 color = body.get("color") or "ededed"
                 label = {"name": name, "color": color}
                 repo.labels[name] = label
-                # A new label can change a cached issue's label colors.
+                # A new label can change a cached issue's label colours.
                 for iss in repo.issues.values():
                     iss["_json"] = None
                 self.send_json(201, label)
@@ -1713,7 +1730,7 @@ def pr_mergeable(repo, pr):
 
 
 def pr_merge_conflict(repo, pr):
-    """Return a conflicting path or None."""
+    """Return a conflicting path, or None when the PR merges cleanly."""
     base_tip = repo.refs.get("refs/heads/" + pr["base"])
     head_tip = repo.refs.get("refs/heads/" + pr["head"])
     if base_tip is None or head_tip is None:
@@ -1937,8 +1954,8 @@ def _gql_tokens(text):
 
 
 class _GQLParser:
-    """Recursive-descent parser over _gql_tokens output. Produces the
-    operation/field/argument trees _gql_exec_selection consumes."""
+    """Recursive-descent parser over _gql_tokens output. It produces the
+    operation/field/argument trees that _gql_exec_selection consumes."""
 
     def __init__(self, text):
         self.toks = _gql_tokens(text)
@@ -2076,10 +2093,10 @@ def _gql_resolve(node, variables):
     if kind == "list":
         return [_gql_resolve(x, variables) for x in node[1]]
     if kind == "object":
-        out = {}
-        for k, v in node[1].items():
-            out[k] = _gql_resolve(v, variables)
-        return out
+        resolved = {}
+        for key, val in node[1].items():
+            resolved[key] = _gql_resolve(val, variables)
+        return resolved
     return None
 
 
@@ -2300,6 +2317,7 @@ def _gql_pr_by_gid(gid_value):
     if pr is None:
         return (None, None), "unknown pull request"
     return (repo, pr), None
+
 
 def _gql_resolve_field(type_name, value, name, args):
     """Returns (found, result). Raises ValueError on a failed mutation."""
@@ -2619,8 +2637,8 @@ def _gql_exec_selection(selection, type_name, value, variables):
         fname = field["name"]
         alias = field.get("alias") or fname
         args = {}
-        for k, v in field["args"].items():
-            args[k] = _gql_resolve(v, variables)
+        for key, val in field["args"].items():
+            args[key] = _gql_resolve(val, variables)
         try:
             found, result = _gql_resolve_field(type_name, value, fname, args)
         except Exception as exc:
@@ -2748,7 +2766,7 @@ for _canon, _aliases in _MCP_SYNONYMS.items():
 
 
 def _mcp_norm(args):
-    """Normalize tool arguments by synonym: accept owner/repo, name,
+    """Normalise tool arguments by synonym: accept owner/repo, name,
     full_name, title, body, head, base, pull_number, state, description,
     private, and their common aliases."""
     out = {}
@@ -2757,9 +2775,9 @@ def _mcp_norm(args):
     for key, val in args.items():
         lk = str(key).lower()
         if lk == "full_name" and isinstance(val, str) and "/" in val:
-            o, r = val.split("/", 1)
-            out.setdefault("owner", o)
-            out.setdefault("repo", r)
+            owner, repo = val.split("/", 1)
+            out.setdefault("owner", owner)
+            out.setdefault("repo", repo)
             continue
         canon = _MCP_ALIAS_TO_CANON.get(lk)
         if canon is None:
@@ -3047,9 +3065,9 @@ def _have_closure(repo, haves, old_shallow):
                 if oid not in shallow_set:
                     stack.extend(parsed["parents"])
         elif otype == "tag":
-            t = tag_of(repo, oid)
-            if t is not None and t["object"]:
-                stack.append(t["object"])
+            tagged = tag_of(repo, oid)
+            if tagged is not None and tagged["object"]:
+                stack.append(tagged["object"])
         elif otype == "tree":
             for _mode, _name, child in tree_of(repo, oid):
                 stack.append(child)
@@ -3059,10 +3077,10 @@ def _have_closure(repo, haves, old_shallow):
 def _git_fetch_objects(repo, wants, haves, depth, old_shallow):
     """Objects to send for a fetch, plus shallow/unshallow boundary lists.
 
-    The BFS is depth-limited: with a deepen limit it only ever walks as far
-    as the fetch can send, so a depth-1 clone of a 200-commit history visits
-    one commit instead of all 200. Parsed commits come from the memo, so a
-    repeated fetch of the same tip costs almost nothing."""
+    The BFS is depth-limited: with a deepen limit it only ever walks as
+    far as the fetch can send, so a depth-1 clone of a 200-commit history
+    visits one commit instead of all 200. Parsed commits come from the
+    memo, so a repeated fetch of the same tip costs almost nothing."""
     want_commits = []
     extra = {}
     for want in wants:
@@ -3138,12 +3156,12 @@ def _git_fetch_objects(repo, wants, haves, depth, old_shallow):
 
 
 def _git_fetch_pack(repo, wants, haves, depth, old_shallow):
-    """(pack_bytes, shallow, unshallow) for a fetch, memoized on its inputs.
+    """(pack_bytes, shallow, unshallow) for a fetch, memoised on its inputs.
 
     A fetch's output is a pure function of its inputs over immutable
     objects, so the cache key (wants, haves, depth, old_shallow) is
     complete: a new tip is a new key, and a repeated clone of the same tip
-    reuses the same pack bytes. Returns the pack already serialized."""
+    reuses the same pack bytes. Returns the pack already serialised."""
     key = (tuple(wants), tuple(sorted(haves)), depth,
            tuple(sorted(old_shallow or [])))
     hit = repo._fetch_cache.get(key)
