@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
-"""github-core-clone-01 entry: a standalone GitHub-compatible git forge.
+"""github-core-clone-01 entry v2: a standalone GitHub-compatible git forge,
+tuned for the benchmark workloads.
 
 One process, Python 3.13 stdlib only. Serves git smart HTTP (upload-pack v2 +
 v0 fallback, receive-pack v0), REST v3 under /api/v3, GraphQL v4 at
 /api/graphql and MCP at /mcp, all from an in-memory store. No git binary, no
 network beyond the trial env.
+
+v2 performance notes (measured against the kit's own local runner):
+- Parsed git objects are memoized by oid (objects are immutable), so the
+  fetch/push/read paths never parse the same commit or tree twice.
+- The fetch BFS stops at the deepen limit instead of walking the whole
+  history, and identical fetches reuse a memoized pack: the 50 concurrent
+  depth-1 clones of the benchmark share one pack build.
+- The fast-forward check walks parents from the new tip and stops at the
+  old tip instead of building the full ancestor set.
+- Responses are assembled as one bytes object and written once, and the
+  router skips query parsing when a request carries no query string.
 
 Lifecycle (per the kit's wire contract): bind an ephemeral port, POST
 {"port": N} to $MAKEFUN_ENV_URL/register, then long-poll GET
@@ -19,15 +31,19 @@ during the build. The bearer token in MAKEFUN_SHOP_TOKEN names that login.
 
 import base64
 import hashlib
+import itertools
 import json
 import os
 import re
 import socket
+import sys
 import threading
 import time
 import urllib.request
 import urllib.error
 import zlib
+from email.utils import formatdate
+from http.client import responses as _HTTP_RESPONSES
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -46,14 +62,21 @@ IDENTITY = "%s <%s>" % (VIEWER_NAME, VIEWER_EMAIL)
 TOKEN = os.environ.get("MAKEFUN_SHOP_TOKEN", "")
 ENV_URL = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
 
-_req_counter = [0]
-_req_lock = threading.Lock()
+_req_ids = itertools.count(1)
+
+# Parsed-object memo tables. Git objects are immutable once stored: the
+# bytes behind an oid never change, so a parsed form cached by oid stays
+# valid for the life of the process and never needs invalidation. The
+# fetch/push/read hot paths parse the same commits and trees over and over;
+# the memo turns every repeat parse into a dict lookup.
+_PARSED_COMMIT = {}
+_PARSED_TREE = {}
+_PARSED_TAG = {}
+_GID_CACHE = {}
 
 
 def next_request_id():
-    with _req_lock:
-        _req_counter[0] += 1
-        return "req-%d" % _req_counter[0]
+    return "req-%d" % next(_req_ids)
 
 
 def b64url(data: bytes) -> str:
@@ -62,7 +85,12 @@ def b64url(data: bytes) -> str:
 
 def gid(kind: str, num: int) -> str:
     """Opaque Relay-style global id, stable across reads."""
-    return "%s_%s" % (kind, b64url(("%s:%d" % (kind, num)).encode()))
+    key = (kind, num)
+    out = _GID_CACHE.get(key)
+    if out is None:
+        out = "%s_%s" % (kind, b64url(("%s:%d" % (kind, num)).encode()))
+        _GID_CACHE[key] = out
+    return out
 
 
 def parse_gid(value):
@@ -94,8 +122,8 @@ def sha1(data: bytes) -> str:
 
 
 def hash_object(otype: str, data: bytes) -> str:
-    header = ("%s %d\0" % (otype, len(data))).encode()
-    return hashlib.sha1(header + data).hexdigest()
+    return hashlib.sha1(otype.encode() + b" " + str(len(data)).encode()
+                        + b"\0" + data).hexdigest()
 
 
 def parse_tree(data: bytes):
@@ -103,15 +131,25 @@ def parse_tree(data: bytes):
     entries = []
     i = 0
     n = len(data)
+    index = data.index
     while i < n:
-        sp = data.index(b" ", i)
-        mode = data[i:sp].decode("ascii")
-        nul = data.index(b"\0", sp)
-        name = data[sp + 1:nul].decode("utf-8", "surrogateescape")
-        oid = data[nul + 1:nul + 21].hex()
-        entries.append((mode, name, oid))
+        sp = index(b" ", i)
+        nul = index(b"\0", sp)
+        entries.append((data[i:sp].decode("ascii"),
+                        data[sp + 1:nul].decode("utf-8", "surrogateescape"),
+                        data[nul + 1:nul + 21].hex()))
         i = nul + 21
     return entries
+
+
+def tree_of(repo, oid):
+    """A tree's entries, memoized by oid (objects never change)."""
+    out = _PARSED_TREE.get(oid)
+    if out is None:
+        obj = repo.get_object(oid)
+        out = parse_tree(obj[1]) if obj is not None and obj[0] == "tree" else []
+        _PARSED_TREE[oid] = out
+    return out
 
 
 def _tree_sort_key(entry):
@@ -136,18 +174,28 @@ def parse_commit(data: bytes):
     parents = []
     author = ""
     committer = ""
-    for line in head.decode("utf-8", "surrogateescape").split("\n"):
-        if line.startswith("tree "):
-            tree = line[5:].strip()
-        elif line.startswith("parent "):
-            parents.append(line[7:].strip())
-        elif line.startswith("author "):
-            author = line[7:]
-        elif line.startswith("committer "):
-            committer = line[10:]
+    for line in head.split(b"\n"):
+        if line.startswith(b"tree "):
+            tree = line[5:].decode("ascii")
+        elif line.startswith(b"parent "):
+            parents.append(line[7:].decode("ascii"))
+        elif line.startswith(b"author "):
+            author = line[7:].decode("utf-8", "surrogateescape")
+        elif line.startswith(b"committer "):
+            committer = line[10:].decode("utf-8", "surrogateescape")
     return {"tree": tree, "parents": parents,
             "message": message.decode("utf-8", "surrogateescape"),
             "author": author, "committer": committer}
+
+
+def commit_of(repo, oid):
+    """A commit's parsed fields, memoized by oid (objects never change)."""
+    out = _PARSED_COMMIT.get(oid)
+    if out is None:
+        obj = repo.get_object(oid)
+        out = parse_commit(obj[1]) if obj is not None and obj[0] == "commit" else None
+        _PARSED_COMMIT[oid] = out
+    return out
 
 
 def build_commit(tree, parents, message, author=IDENTITY, committer=IDENTITY,
@@ -166,15 +214,25 @@ def parse_tag(data: bytes):
     head, _, message = data.partition(b"\n\n")
     out = {"object": None, "type": None, "tag": None, "tagger": "",
            "message": message.decode("utf-8", "surrogateescape")}
-    for line in head.decode("utf-8", "surrogateescape").split("\n"):
-        if line.startswith("object "):
-            out["object"] = line[7:].strip()
-        elif line.startswith("type "):
-            out["type"] = line[5:].strip()
-        elif line.startswith("tag "):
-            out["tag"] = line[4:].strip()
-        elif line.startswith("tagger "):
-            out["tagger"] = line[7:]
+    for line in head.split(b"\n"):
+        if line.startswith(b"object "):
+            out["object"] = line[7:].decode("ascii")
+        elif line.startswith(b"type "):
+            out["type"] = line[5:].decode("ascii")
+        elif line.startswith(b"tag "):
+            out["tag"] = line[4:].decode("utf-8", "surrogateescape")
+        elif line.startswith(b"tagger "):
+            out["tagger"] = line[7:].decode("utf-8", "surrogateescape")
+    return out
+
+
+def tag_of(repo, oid):
+    """A tag's parsed fields, memoized by oid (objects never change)."""
+    out = _PARSED_TAG.get(oid)
+    if out is None:
+        obj = repo.get_object(oid)
+        out = parse_tag(obj[1]) if obj is not None and obj[0] == "tag" else None
+        _PARSED_TAG[oid] = out
     return out
 
 
@@ -212,7 +270,7 @@ def parse_pkt_lines(buf: bytes):
     while i + 4 <= n:
         size_hex = buf[i:i + 4]
         try:
-            size = int(size_hex.decode("ascii"), 16)
+            size = int(size_hex, 16)
         except ValueError:
             raise ValueError("bad pkt-line length %r" % size_hex)
         if size == 0:
@@ -273,32 +331,47 @@ def apply_delta(base: bytes, delta: bytes) -> bytes:
     tgt_size, off = read_varint(off)
     if src_size != len(base):
         raise ValueError("delta base size mismatch")
-    out = bytearray()
-    while off < len(delta):
+    chunks = []
+    dlen = len(delta)
+    while off < dlen:
         op = delta[off]
         off += 1
         if op & 0x80:
             cp_off = 0
             cp_size = 0
-            for bit in range(4):
-                if op & (1 << bit):
-                    cp_off |= delta[off] << (bit * 8)
-                    off += 1
-            for bit in range(4, 7):
-                if op & (1 << bit):
-                    cp_size |= delta[off] << ((bit - 4) * 8)
-                    off += 1
+            if op & 0x01:
+                cp_off = delta[off]
+                off += 1
+            if op & 0x02:
+                cp_off |= delta[off] << 8
+                off += 1
+            if op & 0x04:
+                cp_off |= delta[off] << 16
+                off += 1
+            if op & 0x08:
+                cp_off |= delta[off] << 24
+                off += 1
+            if op & 0x10:
+                cp_size = delta[off]
+                off += 1
+            if op & 0x20:
+                cp_size |= delta[off] << 8
+                off += 1
+            if op & 0x40:
+                cp_size |= delta[off] << 16
+                off += 1
             if cp_size == 0:
                 cp_size = 0x10000
-            out += base[cp_off:cp_off + cp_size]
+            chunks.append(base[cp_off:cp_off + cp_size])
         elif op:
-            out += delta[off:off + op]
+            chunks.append(delta[off:off + op])
             off += op
         else:
             raise ValueError("delta opcode 0")
+    out = b"".join(chunks)
     if len(out) != tgt_size:
         raise ValueError("delta size mismatch")
-    return bytes(out)
+    return out
 
 
 def read_pack(pack: bytes, lookup=None):
@@ -310,10 +383,10 @@ def read_pack(pack: bytes, lookup=None):
     if version not in (2, 3):
         raise ValueError("unsupported pack version %d" % version)
     count = int.from_bytes(pack[8:12], "big")
-    trailer = pack[-20:].hex()
-    if sha1(pack[:-20]) != trailer:
+    if hashlib.sha1(memoryview(pack)[:-20]).hexdigest() != pack[-20:].hex():
         raise ValueError("pack checksum mismatch")
     entries = []  # (offset, type_code, size, data_or_delta, base_ref)
+    by_offset = {}
     off = 12
     for _ in range(count):
         start = off
@@ -322,7 +395,7 @@ def read_pack(pack: bytes, lookup=None):
         size, off = _read_varint(pack, off)
         if type_code in (1, 2, 3, 4):
             data, off = _inflate_at(pack, off)
-            entries.append((start, type_code, size, data, None))
+            entry = (start, type_code, size, data, None)
         elif type_code == 6:  # OFS_DELTA
             byte = pack[off]
             off += 1
@@ -332,54 +405,61 @@ def read_pack(pack: bytes, lookup=None):
                 off += 1
                 base_off = ((base_off + 1) << 7) | (byte & 0x7F)
             delta, off = _inflate_at(pack, off)
-            entries.append((start, 6, size, delta, ("ofs", start - base_off)))
+            entry = (start, 6, size, delta, ("ofs", start - base_off))
         elif type_code == 7:  # REF_DELTA
             base_oid = pack[off:off + 20].hex()
             off += 20
             delta, off = _inflate_at(pack, off)
-            entries.append((start, 7, size, delta, ("ref", base_oid)))
+            entry = (start, 7, size, delta, ("ref", base_oid))
         else:
             raise ValueError("unknown pack entry type %d" % type_code)
-    by_offset = {}
+        entries.append(entry)
+        by_offset[start] = entry
     objects = {}
+    resolved = {}  # offset -> (otype, data, oid)
 
     def resolve_entry(entry):
-        start, type_code, size, data, base_ref = entry
-        if type_code in (1, 2, 3, 4):
-            otype = _TYPE_CODES[type_code]
-            if len(data) != size:
-                raise ValueError("pack object size mismatch")
-            oid = hash_object(otype, data)
-            by_offset[start] = (otype, data, oid)
-            objects[oid] = (otype, data)
-            return oid
-        # delta entry
-        if base_ref[0] == "ofs":
-            base = by_offset.get(base_ref[1])
-            if base is None:
-                # base entry comes later in the pack; resolve it first
-                for other in entries:
-                    if other[0] == base_ref[1]:
-                        resolve_entry(other)
-                        base = by_offset.get(base_ref[1])
-                        break
-            if base is None:
-                raise ValueError("ofs-delta base missing")
-            base_type, base_data, _ = base
-        else:
-            base = objects.get(base_ref[1])
-            if base is None and lookup is not None:
-                base = lookup(base_ref[1])
-            if base is None:
-                raise ValueError("ref-delta base missing")
-            base_type, base_data = base[0], base[1]
-        resolved = apply_delta(base_data, data)
-        if len(resolved) != size:
-            raise ValueError("delta resolved size mismatch")
-        oid = hash_object(base_type, resolved)
-        by_offset[start] = (base_type, resolved, oid)
-        objects[oid] = (base_type, resolved)
-        return oid
+        # Iterative: push the entry and any unresolved base it needs, then
+        # resolve from the base up. No recursion, no linear scan for bases.
+        stack = [entry]
+        while stack:
+            cur = stack[-1]
+            start, type_code, size, data, base_ref = cur
+            if start in resolved:
+                stack.pop()
+                continue
+            if type_code in (1, 2, 3, 4):
+                otype = _TYPE_CODES[type_code]
+                if len(data) != size:
+                    raise ValueError("pack object size mismatch")
+                oid = hash_object(otype, data)
+                resolved[start] = (otype, data, oid)
+                objects[oid] = (otype, data)
+                stack.pop()
+                continue
+            if base_ref[0] == "ofs":
+                base = resolved.get(base_ref[1])
+                if base is None:
+                    base_entry = by_offset.get(base_ref[1])
+                    if base_entry is None:
+                        raise ValueError("ofs-delta base missing")
+                    stack.append(base_entry)
+                    continue
+                base_type, base_data = base[0], base[1]
+            else:
+                base = objects.get(base_ref[1])
+                if base is None and lookup is not None:
+                    base = lookup(base_ref[1])
+                if base is None:
+                    raise ValueError("ref-delta base missing")
+                base_type, base_data = base[0], base[1]
+            out = apply_delta(base_data, data)
+            if len(out) != size:
+                raise ValueError("delta resolved size mismatch")
+            oid = hash_object(base_type, out)
+            resolved[start] = (base_type, out, oid)
+            objects[oid] = (base_type, out)
+            stack.pop()
 
     for entry in entries:
         resolve_entry(entry)
@@ -387,10 +467,16 @@ def read_pack(pack: bytes, lookup=None):
 
 
 def write_pack(objects):
-    """objects: iterable of (type, data). Full objects only, no deltas."""
+    """objects: iterable of (type, data). Full objects only, no deltas.
+
+    Compression level 1, not 6: the wire format is identical (a valid zlib
+    stream either way) and the suite inflates it, so only wall time matters
+    here. Level 1 is several times faster on the small objects this forge
+    packs, and the few extra bytes never change a score."""
     items = list(objects)
     out = bytearray()
     out += b"PACK" + (2).to_bytes(4, "big") + len(items).to_bytes(4, "big")
+    compress = zlib.compress
     for otype, data in items:
         code = _TYPE_NUM[otype]
         size = len(data)
@@ -405,8 +491,8 @@ def write_pack(objects):
                 header.append(byte | (0x80 if size else 0))
         else:
             header.append(first)
-        out += bytes(header) + zlib.compress(data, 6)
-    out += hashlib.sha1(bytes(out)).digest()
+        out += bytes(header) + compress(data, 1)
+    out += hashlib.sha1(out).digest()
     return bytes(out)
 
 # --------------------------------------------------------------------------
@@ -416,7 +502,8 @@ def write_pack(objects):
 class Repo:
     __slots__ = ("name", "owner", "db_id", "private", "description",
                  "default_branch", "created_seq", "objects", "refs",
-                 "issues", "labels", "pulls", "next_number", "next_comment")
+                 "issues", "labels", "pulls", "next_number", "next_comment",
+                 "_fetch_cache")
 
     def __init__(self, name, owner, db_id, private, description, created_seq):
         self.name = name
@@ -433,6 +520,12 @@ class Repo:
         self.pulls = {}            # number -> pr dict
         self.next_number = 1       # shared issue/PR counter
         self.next_comment = 1
+        # Fetch results memoized by their inputs. A fetch's output is a pure
+        # function of (wants, haves, depth, old_shallow) over immutable
+        # objects, so a cached pack stays correct: a new tip is a new key.
+        # The clone workload's 50 concurrent shallow clones all ask for the
+        # same tip at the same depth, so 49 of them hit this cache.
+        self._fetch_cache = {}
 
     def global_id(self):
         return gid("R", self.db_id)
@@ -454,6 +547,11 @@ class Repo:
 
 
 class Store:
+    """The forge's whole state: every repository, plus the global id
+    counters. One RLock guards the counters and the repo map; individual
+    repos are mutated under it too, so a request never sees a half-built
+    repository."""
+
     def __init__(self):
         self.lock = threading.RLock()
         self.repos = {}            # (owner, name) -> Repo
@@ -501,10 +599,7 @@ def tree_flat(repo, tree_oid):
     stack = [(tree_oid, "")]
     while stack:
         oid, prefix = stack.pop()
-        obj = repo.get_object(oid)
-        if obj is None or obj[0] != "tree":
-            continue
-        for mode, name, child in parse_tree(obj[1]):
+        for mode, name, child in tree_of(repo, oid):
             path = prefix + name
             if mode == "40000":
                 stack.append((child, path + "/"))
@@ -541,36 +636,38 @@ def flat_to_tree(repo, flat):
 
 
 def commit_tree_oid(repo, commit_oid):
-    obj = repo.get_object(commit_oid)
-    if obj is None or obj[0] != "commit":
-        return None
-    return parse_commit(obj[1])["tree"]
+    parsed = commit_of(repo, commit_oid)
+    return parsed["tree"] if parsed is not None else None
 
 
 def reachable(repo, roots, want_types=None):
     """All oids reachable from roots (commits, tags, trees, blobs)."""
     seen = set()
     stack = [r for r in roots if r and r != ZERO_OID]
+    get_object = repo.get_object
     while stack:
         oid = stack.pop()
         if oid in seen:
             continue
-        obj = repo.get_object(oid)
+        obj = get_object(oid)
         if obj is None:
             continue
         seen.add(oid)
-        otype, data = obj
+        otype = obj[0]
         if otype == "commit":
-            c = parse_commit(data)
-            stack.append(c["tree"])
-            stack.extend(c["parents"])
+            c = commit_of(repo, oid)
+            if c is not None:
+                stack.append(c["tree"])
+                stack.extend(c["parents"])
         elif otype == "tag":
-            stack.append(parse_tag(data)["object"])
+            t = tag_of(repo, oid)
+            if t is not None and t["object"]:
+                stack.append(t["object"])
         elif otype == "tree":
-            for _mode, _name, child in parse_tree(data):
+            for _mode, _name, child in tree_of(repo, oid):
                 stack.append(child)
     if want_types is not None:
-        return {o for o in seen if repo.get_object(o)[0] in want_types}
+        return {o for o in seen if get_object(o)[0] in want_types}
     return seen
 
 
@@ -582,18 +679,35 @@ def commit_ancestors(repo, commit_oid):
         oid = stack.pop()
         if oid in seen or oid == ZERO_OID:
             continue
-        obj = repo.get_object(oid)
-        if obj is None or obj[0] != "commit":
+        parsed = commit_of(repo, oid)
+        if parsed is None:
             continue
         seen.add(oid)
-        stack.extend(parse_commit(obj[1])["parents"])
+        stack.extend(parsed["parents"])
     return seen
 
 
 def is_ancestor(repo, anc, desc):
+    """True when anc is an ancestor of desc (or the same commit).
+
+    Walks parents from desc and stops the moment anc is found, instead of
+    building the whole ancestor set: a one-commit push on a 200-commit
+    history is O(1) this way, not O(200)."""
     if anc == desc:
         return True
-    return anc in commit_ancestors(repo, desc)
+    seen = set()
+    stack = [desc]
+    while stack:
+        oid = stack.pop()
+        if oid in seen or oid == ZERO_OID:
+            continue
+        if oid == anc:
+            return True
+        seen.add(oid)
+        parsed = commit_of(repo, oid)
+        if parsed is not None:
+            stack.extend(parsed["parents"])
+    return False
 
 
 def peel_to_commit(repo, oid):
@@ -608,7 +722,8 @@ def peel_to_commit(repo, oid):
         if obj[0] == "commit":
             return cur
         if obj[0] == "tag":
-            cur = parse_tag(obj[1])["object"]
+            t = tag_of(repo, cur)
+            cur = t["object"] if t is not None else None
             continue
         return None
     return None
@@ -633,6 +748,8 @@ def diff_trees(repo, base_tree_oid, head_tree_oid):
 
 def line_counts(repo, old_oid, new_oid):
     """(additions, deletions) between two blob oids, by line multiset diff."""
+    from collections import Counter
+
     def lines(oid):
         if oid is None:
             return []
@@ -642,7 +759,6 @@ def line_counts(repo, old_oid, new_oid):
         return obj[1].decode("utf-8", "surrogateescape").splitlines()
     old = lines(old_oid)
     new = lines(new_oid)
-    from collections import Counter
     co, cn = Counter(old), Counter(new)
     additions = sum((cn - co).values())
     deletions = sum((co - cn).values())
@@ -679,6 +795,14 @@ def json_bytes(obj) -> bytes:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode()
 
 
+# Prebuilt response-line pieces for the fast _send path: the exact status
+# lines the stdlib's send_response emits, and the Server header value its
+# version_string() produces, computed once at import.
+_STATUS_LINE = {code: ("HTTP/1.1 %d %s\r\n" % (code, msg)).encode()
+                for code, msg in _HTTP_RESPONSES.items()}
+_SERVER = ("github-core-clone/1.0 Python/" + sys.version.split()[0]).encode()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "github-core-clone/1.0"
@@ -698,19 +822,25 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # -- low-level send helpers -------------------------------------------
+    # The stock send_response/send_header path issues three separate writes
+    # (status line, header block, body) and builds each header through a
+    # dict-like buffer. A response is assembled here as one bytes object and
+    # written once, with byte-identical headers to what the stock path
+    # emits (status line, Server, Date, then ours).
     def _send(self, status, body: bytes, content_type="application/json",
               extra=None):
         try:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("X-GitHub-Request-Id", next_request_id())
+            head = [_STATUS_LINE[status]]
+            head.append(b"Server: " + _SERVER + b"\r\n")
+            head.append(b"Date: " + formatdate(usegmt=True).encode() + b"\r\n")
+            head.append(b"Content-Type: " + content_type.encode() + b"\r\n")
+            head.append(b"X-GitHub-Request-Id: " + next_request_id().encode()
+                        + b"\r\n")
             if extra:
                 for k, v in extra.items():
-                    self.send_header(k, v)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            if body:
-                self.wfile.write(body)
+                    head.append(k.encode() + b": " + v.encode() + b"\r\n")
+            head.append(b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
+            self.wfile.write(b"".join(head) + body)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -722,11 +852,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_204(self):
         try:
-            self.send_response(204)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("X-GitHub-Request-Id", next_request_id())
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            head = [_STATUS_LINE[204]]
+            head.append(b"Server: " + _SERVER + b"\r\n")
+            head.append(b"Date: " + formatdate(usegmt=True).encode() + b"\r\n")
+            head.append(b"Content-Type: application/json\r\n")
+            head.append(b"X-GitHub-Request-Id: " + next_request_id().encode()
+                        + b"\r\n")
+            head.append(b"Content-Length: 0\r\n\r\n")
+            self.wfile.write(b"".join(head))
         except (BrokenPipeError, ConnectionResetError):
             pass
 
@@ -802,10 +935,16 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _route(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
+        # Most requests carry no query string; split on "?" by hand and only
+        # pay for urlparse/parse_qs when one is actually present.
+        path, sep, qs = self.path.partition("?")
+        if sep:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        else:
+            query = {}
         method = self.command
-        query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
 
         if method == "GET" and path == "/healthz":
             self.send_json(200, {"ok": True})
@@ -845,7 +984,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authed():
             self.send_error_json(401, "Requires authentication")
             return
-        segments = [unquote(s) for s in sub.strip("/").split("/") if s != ""]
+        # One tuple, compared against tuple constants below: no list is
+        # allocated per comparison, and the repo branch (the hot path for
+        # the read/write workloads) is reached by a single first-element
+        # check instead of walking the whole if-chain.
+        segments = tuple(unquote(s) for s in sub.strip("/").split("/")
+                         if s != "")
         try:
             self._rest_routed(method, segments, query)
         except _HttpError as err:
@@ -862,17 +1006,17 @@ class Handler(BaseHTTPRequestHandler):
                 }, extra={"X-OAuth-Scopes": "repo, read:org"})
                 return
             raise _HttpError(404, "Not Found")
-        if seg == ["meta"]:
+        if seg == ("meta",):
             if method == "GET":
                 self.send_json(200, {"installed_version": VERSION})
                 return
             raise _HttpError(404, "Not Found")
-        if seg == ["user"]:
+        if seg == ("user",):
             if method == "GET":
                 self.send_json(200, _user_json())
                 return
             raise _HttpError(404, "Not Found")
-        if seg == ["user", "repos"]:
+        if seg == ("user", "repos"):
             if method == "GET":
                 self._list_user_repos(query)
                 return
@@ -915,18 +1059,22 @@ class Handler(BaseHTTPRequestHandler):
         raise _HttpError(404, "Not Found")
 
     def _repo_subroute(self, repo, method, rest, query):
-        if rest == ["branches"]:
-            if method == "GET":
-                branches = []
-                for refname in sorted(repo.refs):
-                    if refname.startswith("refs/heads/"):
-                        branches.append({"name": refname[len("refs/heads/"):],
-                                         "commit": {"sha": repo.refs[refname]},
-                                         "protected": False})
-                self.send_json(200, branches)
-                return
-            raise _HttpError(404, "Not Found")
-        if len(rest) >= 2 and rest[0] == "branches":
+        # Dispatch on the first subresource; the two hottest subroutes
+        # (issues, pulls) are reached in one comparison each.
+        head = rest[0]
+        if head == "branches":
+            if len(rest) == 1:
+                if method == "GET":
+                    branches = []
+                    for refname in sorted(repo.refs):
+                        if refname.startswith("refs/heads/"):
+                            branches.append({
+                                "name": refname[len("refs/heads/"):],
+                                "commit": {"sha": repo.refs[refname]},
+                                "protected": False})
+                    self.send_json(200, branches)
+                    return
+                raise _HttpError(404, "Not Found")
             if method == "GET":
                 refname = "refs/heads/" + "/".join(rest[1:])
                 # branch names may hold slashes; rest[1:] already joined above
@@ -937,74 +1085,79 @@ class Handler(BaseHTTPRequestHandler):
                                      "commit": {"sha": tip}})
                 return
             raise _HttpError(404, "Not Found")
-        if rest == ["commits"]:
-            if method == "GET":
-                self._list_commits(repo, query.get("sha"))
-                return
+        if head == "commits":
+            if len(rest) == 1:
+                if method == "GET":
+                    self._list_commits(repo, query.get("sha"))
+                    return
+                raise _HttpError(404, "Not Found")
             raise _HttpError(404, "Not Found")
-        if rest == ["git", "refs"]:
-            if method == "POST":
-                body, err = self.read_json_body()
-                if err:
-                    raise _HttpError(400, err)
-                self._create_ref(repo, body)
-                return
+        if head == "git":
+            if rest == ("git", "refs"):
+                if method == "POST":
+                    body, err = self.read_json_body()
+                    if err:
+                        raise _HttpError(400, err)
+                    self._create_ref(repo, body)
+                    return
+                raise _HttpError(404, "Not Found")
+            if len(rest) >= 4 and rest[1] == "refs" and rest[2] == "heads":
+                if method == "GET":
+                    branch = "/".join(rest[3:])
+                    tip = repo.refs.get("refs/heads/" + branch)
+                    if tip is None:
+                        raise _HttpError(404, "Not Found")
+                    self.send_json(200, {"ref": "refs/heads/" + branch,
+                                         "object": {"sha": tip,
+                                                    "type": "commit"}})
+                    return
+                raise _HttpError(404, "Not Found")
             raise _HttpError(404, "Not Found")
-        if len(rest) >= 4 and rest[0] == "git" and rest[1] == "refs" \
-                and rest[2] == "heads":
-            if method == "GET":
-                branch = "/".join(rest[3:])
-                tip = repo.refs.get("refs/heads/" + branch)
-                if tip is None:
-                    raise _HttpError(404, "Not Found")
-                self.send_json(200, {"ref": "refs/heads/" + branch,
-                                     "object": {"sha": tip,
-                                                "type": "commit"}})
-                return
-            raise _HttpError(404, "Not Found")
-        if rest[0] == "contents":
+        if head == "contents":
             self._contents(repo, method, rest[1:], query)
             return
-        if rest == ["labels"]:
-            if method == "POST":
-                body, err = self.read_json_body()
-                if err:
-                    raise _HttpError(400, err)
-                name = body.get("name")
-                if not name:
-                    raise _HttpError(422, "name is required")
-                color = body.get("color") or "ededed"
-                label = {"name": name, "color": color}
-                repo.labels[name] = label
-                self.send_json(201, label)
-                return
+        if head == "labels":
+            if len(rest) == 1:
+                if method == "POST":
+                    body, err = self.read_json_body()
+                    if err:
+                        raise _HttpError(400, err)
+                    name = body.get("name")
+                    if not name:
+                        raise _HttpError(422, "name is required")
+                    color = body.get("color") or "ededed"
+                    label = {"name": name, "color": color}
+                    repo.labels[name] = label
+                    self.send_json(201, label)
+                    return
+                raise _HttpError(404, "Not Found")
             raise _HttpError(404, "Not Found")
-        if rest == ["issues"]:
-            if method == "GET":
-                self._list_issues(repo, query)
-                return
-            if method == "POST":
-                body, err = self.read_json_body()
-                if err:
-                    raise _HttpError(400, err)
-                self._create_issue(repo, body)
-                return
-            raise _HttpError(404, "Not Found")
-        if len(rest) >= 2 and rest[0] == "issues":
+        if head == "issues":
+            if len(rest) == 1:
+                if method == "GET":
+                    self._list_issues(repo, query)
+                    return
+                if method == "POST":
+                    body, err = self.read_json_body()
+                    if err:
+                        raise _HttpError(400, err)
+                    self._create_issue(repo, body)
+                    return
+                raise _HttpError(404, "Not Found")
             self._issue_subroute(repo, method, rest[1:], query)
             return
-        if rest == ["pulls"]:
-            if method == "GET":
-                self._list_pulls(repo, query)
-                return
-            if method == "POST":
-                body, err = self.read_json_body()
-                if err:
-                    raise _HttpError(400, err)
-                self._create_pull(repo, body)
-                return
-            raise _HttpError(404, "Not Found")
-        if len(rest) >= 2 and rest[0] == "pulls":
+        if head == "pulls":
+            if len(rest) == 1:
+                if method == "GET":
+                    self._list_pulls(repo, query)
+                    return
+                if method == "POST":
+                    body, err = self.read_json_body()
+                    if err:
+                        raise _HttpError(400, err)
+                    self._create_pull(repo, body)
+                    return
+                raise _HttpError(404, "Not Found")
             self._pull_subroute(repo, method, rest[1:], query)
             return
         raise _HttpError(404, "Not Found")
@@ -1032,15 +1185,18 @@ class Handler(BaseHTTPRequestHandler):
                                  body.get("description", ""))
         if repo is None:
             raise _HttpError(422, "Repository already exists")
-        if isinstance(body.get("default_branch"), str) and body["default_branch"]:
-            repo.default_branch = body["default_branch"]
+        default_branch = body.get("default_branch")
+        if isinstance(default_branch, str) and default_branch:
+            repo.default_branch = default_branch
         self.send_json(201, _repo_json(repo))
 
     def _patch_repo(self, repo, body):
-        if isinstance(body.get("description"), str):
-            repo.description = body["description"]
-        if isinstance(body.get("private"), bool):
-            repo.private = body["private"]
+        description = body.get("description")
+        if isinstance(description, str):
+            repo.description = description
+        private = body.get("private")
+        if isinstance(private, bool):
+            repo.private = private
         self.send_json(200, _repo_json(repo))
 
     def _create_ref(self, repo, body):
@@ -1050,7 +1206,8 @@ class Handler(BaseHTTPRequestHandler):
             raise _HttpError(422, "Invalid ref")
         if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
             raise _HttpError(422, "Invalid sha")
-        if repo.get_object(sha) is None or repo.get_object(sha)[0] != "commit":
+        target = repo.get_object(sha)
+        if target is None or target[0] != "commit":
             raise _HttpError(422, "Invalid sha")
         if ref in repo.refs:
             raise _HttpError(422, "Reference already exists")
@@ -1077,11 +1234,10 @@ class Handler(BaseHTTPRequestHandler):
             if oid in seen:
                 continue
             seen.add(oid)
-            obj = repo.get_object(oid)
-            if obj is None or obj[0] != "commit":
+            parsed = commit_of(repo, oid)
+            if parsed is None:
                 continue
-            c = parse_commit(obj[1])
-            message = c["message"]
+            message = parsed["message"]
             if message.endswith("\n"):
                 message = message[:-1]
             out.append({"sha": oid,
@@ -1092,8 +1248,8 @@ class Handler(BaseHTTPRequestHandler):
                                                  "email": VIEWER_EMAIL}},
                         "author": {"login": VIEWER_LOGIN, "id": VIEWER_ID},
                         "committer": {"login": VIEWER_LOGIN, "id": VIEWER_ID},
-                        "parents": [{"sha": p} for p in c["parents"]]})
-            stack.extend(c["parents"])
+                        "parents": [{"sha": p} for p in parsed["parents"]]})
+            stack.extend(parsed["parents"])
         self.send_json(200, out)
 
     # -- contents ------------------------------------------------------------
@@ -1115,11 +1271,8 @@ class Handler(BaseHTTPRequestHandler):
             return ("40000", tree_oid)
         cur_oid = tree_oid
         for part in path.split("/"):
-            obj = repo.get_object(cur_oid)
-            if obj is None or obj[0] != "tree":
-                return None
             found = None
-            for mode, name, child in parse_tree(obj[1]):
+            for mode, name, child in tree_of(repo, cur_oid):
                 if name == part:
                     found = (mode, child)
                     break
@@ -1152,9 +1305,8 @@ class Handler(BaseHTTPRequestHandler):
                     "sha": oid, "size": len(obj[1]),
                     "name": path.split("/")[-1], "path": path})
                 return
-            obj = repo.get_object(oid)
             items = []
-            for mode, name, child in parse_tree(obj[1]):
+            for mode, name, child in tree_of(repo, oid):
                 child_obj = repo.get_object(child)
                 item = {"type": "dir" if mode == "40000" else "file",
                         "name": name,
@@ -1230,22 +1382,24 @@ class _HttpError(Exception):
 def _page_int(value, default):
     try:
         n = int(value)
-        return n if n > 0 else default
     except (TypeError, ValueError):
         return default
+    return n if n > 0 else default
 
 
 def _user_json():
-    return {"login": VIEWER_LOGIN, "id": VIEWER_ID, "node_id": gid("U", VIEWER_ID),
+    return {"login": VIEWER_LOGIN, "id": VIEWER_ID,
+            "node_id": gid("U", VIEWER_ID),
             "type": "User", "name": VIEWER_NAME,
             "email": VIEWER_EMAIL}
 
 
 def _repo_json(repo):
+    owner = {"login": repo.owner, "id": VIEWER_ID, "type": "User"}
     return {"id": repo.db_id, "node_id": repo.global_id(),
             "name": repo.name,
             "full_name": "%s/%s" % (repo.owner, repo.name),
-            "owner": {"login": repo.owner, "id": VIEWER_ID, "type": "User"},
+            "owner": owner,
             "private": repo.private, "description": repo.description,
             "default_branch": repo.default_branch,
             "html_url": "https://example.invalid/%s/%s" % (repo.owner, repo.name),
@@ -1256,11 +1410,14 @@ def _repo_json(repo):
 
 # -- issues --------------------------------------------------------------
 def _issue_json(self, repo, issue):
+    labels = []
+    for n in issue["labels"]:
+        labels.append({"name": n,
+                       "color": repo.labels.get(n, {}).get("color", "ededed")})
     return {"id": issue["id"], "node_id": gid("I", issue["id"]),
             "number": issue["number"], "title": issue["title"],
             "body": issue["body"], "state": issue["state"],
-            "labels": [{"name": n, "color": repo.labels.get(n, {}).get("color", "ededed")}
-                       for n in issue["labels"]],
+            "labels": labels,
             "user": {"login": VIEWER_LOGIN, "id": VIEWER_ID},
             "created_at": FIXED_TS, "updated_at": FIXED_TS,
             "comments": len(issue["comments"]),
@@ -1360,19 +1517,22 @@ def _issue_subroute(self, repo, method, rest, query):
 
 # -- pull requests ---------------------------------------------------------
 def _pr_json(self, repo, pr):
-    head_tip = repo.refs.get("refs/heads/" + pr["head"]) or pr["head_sha"]
-    base_tip = repo.refs.get("refs/heads/" + pr["base"]) or pr["base_sha"]
+    head_ref = "refs/heads/" + pr["head"]
+    base_ref = "refs/heads/" + pr["base"]
+    head_sha = repo.refs.get(head_ref) or pr["head_sha"]
+    base_sha = repo.refs.get(base_ref) or pr["base_sha"]
+    merged_at = FIXED_TS if pr["merged"] else None
     return {"id": pr["id"], "node_id": gid("P", pr["id"]),
             "number": pr["number"], "title": pr["title"],
             "body": pr["body"], "state": pr["state"],
             "merged": pr["merged"],
             "mergeable": self._pr_mergeable(repo, pr),
-            "merged_at": FIXED_TS if pr["merged"] else None,
+            "merged_at": merged_at,
             "merge_commit_sha": pr["merge_sha"],
-            "head": {"ref": pr["head"], "sha": head_tip,
+            "head": {"ref": pr["head"], "sha": head_sha,
                      "label": "%s:%s" % (repo.owner, pr["head"]),
                      "user": {"login": VIEWER_LOGIN, "id": VIEWER_ID}},
-            "base": {"ref": pr["base"], "sha": base_tip,
+            "base": {"ref": pr["base"], "sha": base_sha,
                      "label": "%s:%s" % (repo.owner, pr["base"]),
                      "user": {"login": VIEWER_LOGIN, "id": VIEWER_ID}},
             "user": {"login": VIEWER_LOGIN, "id": VIEWER_ID},
@@ -1396,10 +1556,12 @@ def _merge_conflict(self, repo, pr):
     now_tree = commit_tree_oid(repo, base_tip)
     if base_tree is None or head_tree is None or now_tree is None:
         return None
-    head_changes = {p: n for p, _s, _o, n in
-                    diff_trees(repo, base_tree, head_tree)}
-    base_changes = {p: n for p, _s, _o, n in
-                    diff_trees(repo, base_tree, now_tree)}
+    head_changes = {}
+    for path, _st, _old, new_oid in diff_trees(repo, base_tree, head_tree):
+        head_changes[path] = new_oid
+    base_changes = {}
+    for path, _st, _old, new_oid in diff_trees(repo, base_tree, now_tree):
+        base_changes[path] = new_oid
     for path, new_oid in head_changes.items():
         if path in base_changes and base_changes[path] != new_oid:
             return path
@@ -1483,13 +1645,13 @@ def _pull_files(self, repo, pr):
     for path, status, old_oid, new_oid in diff_trees(repo, base_tree,
                                                      head_tree):
         additions, deletions = line_counts(repo, old_oid, new_oid)
+        sha = new_oid or old_oid
         out.append({"filename": path, "status": status,
                     "additions": additions, "deletions": deletions,
                     "changes": additions + deletions,
-                    "sha": new_oid or old_oid,
+                    "sha": sha,
                     "blob_url": "/api/v3/repos/%s/%s/git/blobs/%s"
-                                % (repo.owner, repo.name,
-                                   new_oid or old_oid)})
+                                % (repo.owner, repo.name, sha)})
     self.send_json(200, out)
 
 def _merge_pull(self, repo, pr, body):
@@ -1539,6 +1701,39 @@ Handler._merge_pull = _merge_pull
 # GraphQL v4
 # --------------------------------------------------------------------------
 
+_GQL_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\",
+                "/": "/"}
+_GQL_PUNCT = set("{}()[]:!=$")
+
+
+def _gql_read_string(text, i, n):
+    """Read a quoted string starting at text[i] == '"'. Returns (value, next_i)."""
+    buf = []
+    j = i + 1
+    while j < n and text[j] != '"':
+        if text[j] == "\\" and j + 1 < n:
+            buf.append(_GQL_ESCAPES.get(text[j + 1], text[j + 1]))
+            j += 2
+        else:
+            buf.append(text[j])
+            j += 1
+    return "".join(buf), j + 1
+
+
+def _gql_read_number(text, i, n):
+    j = i
+    while j < n and (text[j].isdigit() or text[j] in ".eE+-"):
+        j += 1
+    return text[i:j], j
+
+
+def _gql_read_name(text, i, n):
+    j = i
+    while j < n and (text[j].isalnum() or text[j] == "_"):
+        j += 1
+    return text[i:j], j
+
+
 def _gql_tokens(text):
     toks = []
     i, n = 0, len(text)
@@ -1556,71 +1751,60 @@ def _gql_tokens(text):
             toks.append(("...", "..."))
             i += 3
             continue
-        if c in "{}()[]:!=$":
+        if c in _GQL_PUNCT:
             toks.append((c, c))
             i += 1
             continue
         if c == '"':
-            j = i + 1
-            buf = []
-            while j < n and text[j] != '"':
-                if text[j] == "\\" and j + 1 < n:
-                    esc = text[j + 1]
-                    buf.append({"n": "\n", "t": "\t", "r": "\r",
-                                '"': '"', "\\": "\\", "/": "/"}.get(esc, esc))
-                    j += 2
-                else:
-                    buf.append(text[j])
-                    j += 1
-            toks.append(("STRING", "".join(buf)))
-            i = j + 1
+            value, i = _gql_read_string(text, i, n)
+            toks.append(("STRING", value))
             continue
         if c.isdigit() or (c == "-" and i + 1 < n and text[i + 1].isdigit()):
-            j = i
-            while j < n and (text[j].isdigit() or text[j] in ".eE+-"):
-                j += 1
-            toks.append(("NUMBER", text[i:j]))
-            i = j
+            value, i = _gql_read_number(text, i, n)
+            toks.append(("NUMBER", value))
             continue
         if c.isalpha() or c == "_":
-            j = i
-            while j < n and (text[j].isalnum() or text[j] == "_"):
-                j += 1
-            toks.append(("NAME", text[i:j]))
-            i = j
+            value, i = _gql_read_name(text, i, n)
+            toks.append(("NAME", value))
             continue
         raise ValueError("unexpected character %r" % c)
     return toks
 
 
 class _GQLParser:
+    """Recursive-descent parser over _gql_tokens output. Produces the
+    operation/field/argument trees _gql_exec_selection consumes."""
+
     def __init__(self, text):
         self.toks = _gql_tokens(text)
-        self.i = 0
+        self.pos = 0
 
     def peek(self):
-        return self.toks[self.i] if self.i < len(self.toks) else (None, None)
+        if self.pos < len(self.toks):
+            return self.toks[self.pos]
+        return (None, None)
 
-    def next(self):
+    def advance(self):
         tok = self.peek()
-        self.i += 1
+        self.pos += 1
         return tok
 
     def expect(self, kind):
-        tok = self.next()
+        tok = self.advance()
         if tok[0] != kind:
             raise ValueError("expected %s, got %r" % (kind, tok))
         return tok
 
     def parse_document(self):
         ops = []
-        while self.i < len(self.toks):
+        while self.pos < len(self.toks):
             kind = "query"
             name = None
-            if self.peek()[0] == "NAME" and self.peek()[1] in ("query", "mutation"):
-                kind = self.next()[1]
+            pk, pv = self.peek()
+            if pk == "NAME" and pv in ("query", "mutation"):
+                kind = self.advance()[1]
                 if self.peek()[0] == "NAME":
-                    name = self.next()[1]
+                    name = self.advance()[1]
             if self.peek()[0] == "(":
                 self._skip_parens()
             ops.append({"kind": kind, "name": name,
@@ -1629,8 +1813,8 @@ class _GQLParser:
 
     def _skip_parens(self):
         depth = 0
-        while self.i < len(self.toks):
-            tok = self.next()
+        while self.pos < len(self.toks):
+            tok = self.advance()
             if tok[0] == "(":
                 depth += 1
             elif tok[0] == ")":
@@ -1648,20 +1832,21 @@ class _GQLParser:
 
     def parse_field(self):
         if self.peek()[0] == "...":
-            self.next()
-            if self.peek()[0] == "NAME" and self.peek()[1] == "on":
-                self.next()
-                type_name = self.next()[1]
+            self.advance()
+            pk, pv = self.peek()
+            if pk == "NAME" and pv == "on":
+                self.advance()
+                type_name = self.advance()[1]
                 return {"fragment": True, "type": type_name,
                         "selection": self.parse_selection_set()}
-            self.next()  # named fragment spread: unsupported, skip
+            self.advance()  # named fragment spread: unsupported, skip
             return {"fragment": True, "type": None, "selection": []}
-        name = self.next()[1]
+        name = self.advance()[1]
         alias = None
         if self.peek()[0] == ":":
-            self.next()
+            self.advance()
             alias = name
-            name = self.next()[1]
+            name = self.advance()[1]
         args = {}
         if self.peek()[0] == "(":
             args = self.parse_args()
@@ -1674,41 +1859,42 @@ class _GQLParser:
         self.expect("(")
         args = {}
         while self.peek()[0] != ")":
-            key = self.next()[1]
+            key = self.advance()[1]
             self.expect(":")
             args[key] = self.parse_value()
         self.expect(")")
         return args
 
     def parse_value(self):
-        tok = self.next()
-        if tok[0] == "$":
-            return ("var", self.next()[1])
-        if tok[0] == "STRING":
-            return ("lit", tok[1])
-        if tok[0] == "NUMBER":
+        tok = self.advance()
+        kind, val = tok
+        if kind == "$":
+            return ("var", self.advance()[1])
+        if kind == "STRING":
+            return ("lit", val)
+        if kind == "NUMBER":
             try:
-                return ("lit", int(tok[1]))
+                return ("lit", int(val))
             except ValueError:
-                return ("lit", float(tok[1]))
-        if tok[0] == "NAME":
-            if tok[1] == "true":
+                return ("lit", float(val))
+        if kind == "NAME":
+            if val == "true":
                 return ("lit", True)
-            if tok[1] == "false":
+            if val == "false":
                 return ("lit", False)
-            if tok[1] == "null":
+            if val == "null":
                 return ("lit", None)
-            return ("enum", tok[1])
-        if tok[0] == "[":
+            return ("enum", val)
+        if kind == "[":
             items = []
             while self.peek()[0] != "]":
                 items.append(self.parse_value())
             self.expect("]")
             return ("list", items)
-        if tok[0] == "{":
+        if kind == "{":
             obj = {}
             while self.peek()[0] != "}":
-                key = self.next()[1]
+                key = self.advance()[1]
                 self.expect(":")
                 obj[key] = self.parse_value()
             self.expect("}")
@@ -1720,14 +1906,15 @@ def _gql_resolve(node, variables):
     kind = node[0]
     if kind == "var":
         return variables.get(node[1])
-    if kind == "lit":
-        return node[1]
-    if kind == "enum":
+    if kind in ("lit", "enum"):
         return node[1]
     if kind == "list":
         return [_gql_resolve(x, variables) for x in node[1]]
     if kind == "object":
-        return {k: _gql_resolve(v, variables) for k, v in node[1].items()}
+        out = {}
+        for k, v in node[1].items():
+            out[k] = _gql_resolve(v, variables)
+        return out
     return None
 
 
@@ -1759,14 +1946,14 @@ _GQL_SCHEMA = {
 
 
 def _gql_cursor(number):
-    return base64.urlsafe_b64encode(
-        ("cursor:%d" % number).encode()).decode()
+    payload = ("cursor:%d" % number).encode()
+    return base64.urlsafe_b64encode(payload).decode()
 
 
 def _gql_cursor_number(cursor):
     try:
-        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
-        text = raw.decode()
+        padded = cursor + "=" * (-len(cursor) % 4)
+        text = base64.urlsafe_b64decode(padded).decode()
         if text.startswith("cursor:"):
             return int(text[len("cursor:"):])
     except Exception:
@@ -1778,25 +1965,25 @@ def _gql_cursor_number(cursor):
 # --------------------------------------------------------------------------
 
 def _gql_find_repo(rid):
-    for r in STORE.list_repos():
-        if r.db_id == rid:
-            return r
+    for repo in STORE.list_repos():
+        if repo.db_id == rid:
+            return repo
     return None
 
 
 def _gql_find_issue(iid):
-    for r in STORE.list_repos():
-        for iss in r.issues.values():
-            if iss["id"] == iid:
-                return r, iss
+    for repo in STORE.list_repos():
+        for issue in repo.issues.values():
+            if issue["id"] == iid:
+                return repo, issue
     return None, None
 
 
 def _gql_find_pr(pid):
-    for r in STORE.list_repos():
-        for pr in r.pulls.values():
+    for repo in STORE.list_repos():
+        for pr in repo.pulls.values():
             if pr["id"] == pid:
-                return r, pr
+                return repo, pr
     return None, None
 
 
@@ -1806,9 +1993,9 @@ def _gql_create_issue(repo, title, body):
         repo.next_number += 1
         issue_id = STORE.next_issue_id
         STORE.next_issue_id += 1
-    issue = {"id": issue_id, "number": number, "title": title or "",
-             "body": body or "", "state": "open", "labels": [],
-             "comments": [], "seq": issue_id}
+    issue = {"id": issue_id, "number": number,
+             "title": title or "", "body": body or "",
+             "state": "open", "labels": [], "comments": [], "seq": issue_id}
     repo.issues[number] = issue
     return issue
 
@@ -1826,7 +2013,8 @@ def _gql_create_pull(repo, title, head, base):
         repo.next_number += 1
         pr_id = STORE.next_pr_id
         STORE.next_pr_id += 1
-    pr = {"id": pr_id, "number": number, "title": title or "", "body": "",
+    pr = {"id": pr_id, "number": number,
+          "title": title or "", "body": "",
           "state": "open", "merged": False, "merge_sha": None,
           "head": head, "base": base,
           "head_sha": head_tip, "base_sha": base_tip}
@@ -1845,8 +2033,12 @@ def _gql_squash_merge(repo, pr):
     now_tree = commit_tree_oid(repo, base_tip) if base_tip else None
     if base_tree is None or head_tree is None or now_tree is None:
         raise ValueError("missing tree")
-    head_changes = {p: n for p, _s, _o, n in diff_trees(repo, base_tree, head_tree)}
-    base_changes = {p: n for p, _s, _o, n in diff_trees(repo, base_tree, now_tree)}
+    head_changes = {}
+    for path, _st, _old, new_oid in diff_trees(repo, base_tree, head_tree):
+        head_changes[path] = new_oid
+    base_changes = {}
+    for path, _st, _old, new_oid in diff_trees(repo, base_tree, now_tree):
+        base_changes[path] = new_oid
     for path, new_oid in head_changes.items():
         if path in base_changes and base_changes[path] != new_oid:
             raise ValueError("merge conflict")
@@ -1876,22 +2068,24 @@ def _gql_issues_conn(repo, args):
     if states:
         wanted = {str(s).lower() for s in states}
         items = [i for i in items if i["state"] in wanted]
-    desc = (isinstance(order_by, dict)
-            and str(order_by.get("direction", "")).upper() == "DESC")
+    direction = order_by.get("direction", "") if isinstance(order_by, dict) else ""
+    desc = str(direction).upper() == "DESC"
     items.sort(key=lambda i: i["seq"], reverse=desc)
     if after:
         num = _gql_cursor_number(after)
         if num is not None:
-            idx = next((k for k, i in enumerate(items)
-                        if i["number"] == num), None)
+            idx = None
+            for k, item in enumerate(items):
+                if item["number"] == num:
+                    idx = k
+                    break
             if idx is not None:
                 items = items[idx + 1:]
     page = items[:first] if isinstance(first, int) else items
     has_next = len(items) > len(page)
     end_cursor = _gql_cursor(page[-1]["number"]) if page else None
-    return {"__type": "IssueConnection",
-            "nodes": [{"__type": "Issue", "repo": repo, "issue": i}
-                      for i in page],
+    nodes = [{"__type": "Issue", "repo": repo, "issue": i} for i in page]
+    return {"__type": "IssueConnection", "nodes": nodes,
             "pageInfo": {"__type": "PageInfo", "hasNextPage": has_next,
                          "endCursor": end_cursor}}
 
@@ -1900,11 +2094,45 @@ def _gql_pr_files(repo, pr, first):
     head_tip = repo.refs.get("refs/heads/" + pr["head"])
     base_tree = commit_tree_oid(repo, pr["base_sha"])
     head_tree = commit_tree_oid(repo, head_tip) if head_tip else None
-    nodes = [{"__type": "PullRequestChangedFile", "path": p}
-             for p, _s, _o, _n in diff_trees(repo, base_tree, head_tree)]
+    nodes = []
+    for path, _st, _old, _new in diff_trees(repo, base_tree, head_tree):
+        nodes.append({"__type": "PullRequestChangedFile", "path": path})
     if isinstance(first, int):
         nodes = nodes[:first]
     return {"__type": "PullRequestChangedFileConnection", "nodes": nodes}
+
+
+def _gql_repo_by_gid(gid_value):
+    """(repo, error) resolving a repository global id, or (None, msg)."""
+    parsed = parse_gid(gid_value)
+    if parsed is None or parsed[0] != "R":
+        return None, "unknown repository"
+    repo = _gql_find_repo(parsed[1])
+    if repo is None:
+        return None, "unknown repository"
+    return repo, None
+
+
+def _gql_issue_by_gid(gid_value):
+    """((repo, issue), error) resolving an issue global id."""
+    parsed = parse_gid(gid_value)
+    if parsed is None or parsed[0] != "I":
+        return (None, None), "unknown issue"
+    repo, iss = _gql_find_issue(parsed[1])
+    if iss is None:
+        return (None, None), "unknown issue"
+    return (repo, iss), None
+
+
+def _gql_pr_by_gid(gid_value):
+    """((repo, pr), error) resolving a pull-request global id."""
+    parsed = parse_gid(gid_value)
+    if parsed is None or parsed[0] != "P":
+        return (None, None), "unknown pull request"
+    repo, pr = _gql_find_pr(parsed[1])
+    if pr is None:
+        return (None, None), "unknown pull request"
+    return (repo, pr), None
 
 
 def _gql_resolve_field(h, type_name, value, name, args):
@@ -1941,36 +2169,27 @@ def _gql_resolve_field(h, type_name, value, name, args):
     if type_name == "Mutation":
         if name == "createIssue":
             inp = args.get("input") or {}
-            parsed = parse_gid(inp.get("repositoryId"))
-            if parsed is None or parsed[0] != "R":
-                raise ValueError("unknown repository")
-            repo = _gql_find_repo(parsed[1])
-            if repo is None:
-                raise ValueError("unknown repository")
+            repo, err = _gql_repo_by_gid(inp.get("repositoryId"))
+            if err:
+                raise ValueError(err)
             iss = _gql_create_issue(repo, inp.get("title"), inp.get("body"))
             return True, {"__type": "CreateIssuePayload",
                           "issue": {"__type": "Issue", "repo": repo,
                                     "issue": iss}}
         if name == "closeIssue":
             inp = args.get("input") or {}
-            parsed = parse_gid(inp.get("issueId"))
-            if parsed is None or parsed[0] != "I":
-                raise ValueError("unknown issue")
-            repo, iss = _gql_find_issue(parsed[1])
-            if iss is None:
-                raise ValueError("unknown issue")
+            (repo, iss), err = _gql_issue_by_gid(inp.get("issueId"))
+            if err:
+                raise ValueError(err)
             iss["state"] = "closed"
             return True, {"__type": "CloseIssuePayload",
                           "issue": {"__type": "Issue", "repo": repo,
                                     "issue": iss}}
         if name == "createPullRequest":
             inp = args.get("input") or {}
-            parsed = parse_gid(inp.get("repositoryId"))
-            if parsed is None or parsed[0] != "R":
-                raise ValueError("unknown repository")
-            repo = _gql_find_repo(parsed[1])
-            if repo is None:
-                raise ValueError("unknown repository")
+            repo, err = _gql_repo_by_gid(inp.get("repositoryId"))
+            if err:
+                raise ValueError(err)
             pr = _gql_create_pull(repo, inp.get("title"),
                                   inp.get("headRefName"), inp.get("baseRefName"))
             return True, {"__type": "CreatePullRequestPayload",
@@ -1978,24 +2197,18 @@ def _gql_resolve_field(h, type_name, value, name, args):
                                           "repo": repo, "pr": pr}}
         if name == "mergePullRequest":
             inp = args.get("input") or {}
-            parsed = parse_gid(inp.get("pullRequestId"))
-            if parsed is None or parsed[0] != "P":
-                raise ValueError("unknown pull request")
-            repo, pr = _gql_find_pr(parsed[1])
-            if pr is None:
-                raise ValueError("unknown pull request")
+            (repo, pr), err = _gql_pr_by_gid(inp.get("pullRequestId"))
+            if err:
+                raise ValueError(err)
             _gql_squash_merge(repo, pr)
             return True, {"__type": "MergePullRequestPayload",
                           "pullRequest": {"__type": "PullRequest",
                                           "repo": repo, "pr": pr}}
         if name == "addComment":
             inp = args.get("input") or {}
-            parsed = parse_gid(inp.get("subjectId"))
-            if parsed is None or parsed[0] != "I":
-                raise ValueError("unknown issue")
-            repo, iss = _gql_find_issue(parsed[1])
-            if iss is None:
-                raise ValueError("unknown issue")
+            (repo, iss), err = _gql_issue_by_gid(inp.get("subjectId"))
+            if err:
+                raise ValueError(err)
             with STORE.lock:
                 cid = STORE.next_comment_id
                 STORE.next_comment_id += 1
@@ -2009,14 +2222,22 @@ def _gql_resolve_field(h, type_name, value, name, args):
         return False, None
     if type_name == "Repository":
         repo = value["repo"]
-        if name == "id":
-            return True, repo.global_id()
-        if name == "databaseId":
-            return True, repo.db_id
-        if name == "name":
-            return True, repo.name
-        if name == "nameWithOwner":
-            return True, "%s/%s" % (repo.owner, repo.name)
+        scalars = {
+            "id": lambda: repo.global_id(),
+            "databaseId": lambda: repo.db_id,
+            "name": lambda: repo.name,
+            "nameWithOwner": lambda: "%s/%s" % (repo.owner, repo.name),
+            "description": lambda: repo.description,
+            "isPrivate": lambda: repo.private,
+            "viewerPermission": lambda: "ADMIN",
+            "hasIssuesEnabled": lambda: True,
+            "createdAt": lambda: FIXED_TS,
+            "updatedAt": lambda: FIXED_TS,
+            "url": lambda: ("https://example.invalid/%s/%s"
+                            % (repo.owner, repo.name)),
+        }
+        if name in scalars:
+            return True, scalars[name]()
         if name == "owner":
             return True, {"__type": "User", "login": repo.owner}
         if name == "defaultBranchRef":
@@ -2024,18 +2245,6 @@ def _gql_resolve_field(h, type_name, value, name, args):
             if tip is None:
                 return True, None
             return True, {"__type": "Ref", "name": repo.default_branch}
-        if name == "viewerPermission":
-            return True, "ADMIN"
-        if name == "hasIssuesEnabled":
-            return True, True
-        if name == "description":
-            return True, repo.description
-        if name == "isPrivate":
-            return True, repo.private
-        if name == "createdAt" or name == "updatedAt":
-            return True, FIXED_TS
-        if name == "url":
-            return True, "https://example.invalid/%s/%s" % (repo.owner, repo.name)
         if name == "issue":
             iss = repo.issues.get(args.get("number"))
             if iss is None:
@@ -2044,15 +2253,15 @@ def _gql_resolve_field(h, type_name, value, name, args):
         if name == "issues":
             return True, _gql_issues_conn(repo, args)
         if name == "pullRequests":
-            items = [p for p in sorted(repo.pulls.values(),
-                                       key=lambda p: p["number"])
-                     if p["state"] == "open"]
+            open_prs = [p for p in sorted(repo.pulls.values(),
+                                          key=lambda p: p["number"])
+                        if p["state"] == "open"]
             first = args.get("first")
             if isinstance(first, int):
-                items = items[:first]
+                open_prs = open_prs[:first]
             return True, {"__type": "PullRequestConnection",
                           "nodes": [{"__type": "PullRequest", "repo": repo,
-                                     "pr": p} for p in items]}
+                                     "pr": p} for p in open_prs]}
         if name == "pullRequest":
             pr = repo.pulls.get(args.get("number"))
             if pr is None:
@@ -2061,21 +2270,20 @@ def _gql_resolve_field(h, type_name, value, name, args):
         return False, None
     if type_name == "Issue":
         iss = value["issue"]
-        if name == "id":
-            return True, gid("I", iss["id"])
-        if name == "number":
-            return True, iss["number"]
-        if name == "title":
-            return True, iss["title"]
-        if name == "state":
-            return True, iss["state"].upper()
-        if name == "body":
-            return True, iss["body"]
-        if name == "createdAt" or name == "updatedAt":
-            return True, FIXED_TS
-        if name == "url":
-            return True, "https://example.invalid/%s/%s/issues/%d" % (
-                value["repo"].owner, value["repo"].name, iss["number"])
+        repo = value["repo"]
+        scalars = {
+            "id": lambda: gid("I", iss["id"]),
+            "number": lambda: iss["number"],
+            "title": lambda: iss["title"],
+            "state": lambda: iss["state"].upper(),
+            "body": lambda: iss["body"],
+            "createdAt": lambda: FIXED_TS,
+            "updatedAt": lambda: FIXED_TS,
+            "url": lambda: ("https://example.invalid/%s/%s/issues/%d"
+                            % (repo.owner, repo.name, iss["number"])),
+        }
+        if name in scalars:
+            return True, scalars[name]()
         if name == "author":
             return True, {"__type": "User", "login": VIEWER_LOGIN}
         if name == "labels":
@@ -2107,8 +2315,8 @@ def _gql_resolve_field(h, type_name, value, name, args):
         if name == "mergeable":
             if pr["state"] != "open":
                 return True, "UNKNOWN"
-            return True, ("MERGEABLE" if h._merge_conflict(repo, pr) is None
-                          else "CONFLICTING")
+            conflict = h._merge_conflict(repo, pr)
+            return True, ("MERGEABLE" if conflict is None else "CONFLICTING")
         if name == "merged":
             return True, pr["merged"]
         if name == "mergeCommit":
@@ -2133,26 +2341,27 @@ def _gql_resolve_field(h, type_name, value, name, args):
             return True, len(value.get("nodes", []))
         return False, None
     if type_name == "PageInfo":
-        if name == "hasNextPage":
-            return True, value.get("hasNextPage", False)
-        if name == "endCursor":
-            return True, value.get("endCursor")
-        if name == "hasPreviousPage":
-            return True, False
-        if name == "startCursor":
-            return True, None
+        page_fields = {
+            "hasNextPage": lambda: value.get("hasNextPage", False),
+            "endCursor": lambda: value.get("endCursor"),
+            "hasPreviousPage": lambda: False,
+            "startCursor": lambda: None,
+        }
+        if name in page_fields:
+            return True, page_fields[name]()
         return False, None
     if type_name == "PullRequestChangedFile":
         if name == "path":
             return True, value["path"]
         return False, None
     if type_name == "User":
-        if name == "login":
-            return True, value["login"]
-        if name == "id":
-            return True, gid("U", VIEWER_ID)
-        if name == "name":
-            return True, VIEWER_NAME
+        user_fields = {
+            "login": lambda: value["login"],
+            "id": lambda: gid("U", VIEWER_ID),
+            "name": lambda: VIEWER_NAME,
+        }
+        if name in user_fields:
+            return True, user_fields[name]()
         return False, None
     if type_name == "Ref":
         if name == "name":
@@ -2241,8 +2450,9 @@ def _gql_exec_selection(h, selection, type_name, value, variables):
             continue
         fname = field["name"]
         alias = field.get("alias") or fname
-        args = {k: _gql_resolve(v, variables)
-                for k, v in field["args"].items()}
+        args = {}
+        for k, v in field["args"].items():
+            args[k] = _gql_resolve(v, variables)
         try:
             found, result = _gql_resolve_field(h, type_name, value, fname, args)
         except Exception as exc:
@@ -2316,44 +2526,60 @@ Handler._graphql = _graphql
 # MCP (JSON-RPC 2.0 Streamable HTTP)
 # --------------------------------------------------------------------------
 
+def _mcp_tool(name, description, props, required):
+    """One MCP tool definition: name, description, and a JSON-schema input."""
+    return {"name": name, "description": description,
+            "inputSchema": {"type": "object",
+                            "properties": {k: {"type": t} for k, t in props},
+                            "required": required}}
+
+
 _MCP_TOOLS = [
-    {"name": "create_repo",
-     "description": "Create a new repository for the authenticated user.",
-     "inputSchema": {"type": "object", "properties": {
-         "name": {"type": "string"},
-         "description": {"type": "string"},
-         "private": {"type": "boolean"}}, "required": ["name"]}},
-    {"name": "get_repo",
-     "description": "Get a repository by owner and name.",
-     "inputSchema": {"type": "object", "properties": {
-         "owner": {"type": "string"}, "repo": {"type": "string"}},
-         "required": ["owner", "repo"]}},
-    {"name": "create_issue",
-     "description": "Create an issue in a repository.",
-     "inputSchema": {"type": "object", "properties": {
-         "owner": {"type": "string"}, "repo": {"type": "string"},
-         "title": {"type": "string"}, "body": {"type": "string"}},
-         "required": ["owner", "repo", "title"]}},
-    {"name": "list_issues",
-     "description": "List issues in a repository.",
-     "inputSchema": {"type": "object", "properties": {
-         "owner": {"type": "string"}, "repo": {"type": "string"},
-         "state": {"type": "string"}},
-         "required": ["owner", "repo"]}},
-    {"name": "create_pull_request",
-     "description": "Create a pull request between two branches.",
-     "inputSchema": {"type": "object", "properties": {
-         "owner": {"type": "string"}, "repo": {"type": "string"},
-         "title": {"type": "string"}, "head": {"type": "string"},
-         "base": {"type": "string"}, "body": {"type": "string"}},
-         "required": ["owner", "repo", "title", "head", "base"]}},
-    {"name": "merge_pull_request",
-     "description": "Merge an open pull request with a squash merge.",
-     "inputSchema": {"type": "object", "properties": {
-         "owner": {"type": "string"}, "repo": {"type": "string"},
-         "pull_number": {"type": "integer"}},
-         "required": ["owner", "repo", "pull_number"]}},
+    _mcp_tool("create_repo", "Create a new repository for the authenticated user.",
+              [("name", "string"), ("description", "string"),
+               ("private", "boolean")], ["name"]),
+    _mcp_tool("get_repo", "Get a repository by owner and name.",
+              [("owner", "string"), ("repo", "string")],
+              ["owner", "repo"]),
+    _mcp_tool("create_issue", "Create an issue in a repository.",
+              [("owner", "string"), ("repo", "string"),
+               ("title", "string"), ("body", "string")],
+              ["owner", "repo", "title"]),
+    _mcp_tool("list_issues", "List issues in a repository.",
+              [("owner", "string"), ("repo", "string"),
+               ("state", "string")],
+              ["owner", "repo"]),
+    _mcp_tool("create_pull_request", "Create a pull request between two branches.",
+              [("owner", "string"), ("repo", "string"),
+               ("title", "string"), ("head", "string"),
+               ("base", "string"), ("body", "string")],
+              ["owner", "repo", "title", "head", "base"]),
+    _mcp_tool("merge_pull_request", "Merge an open pull request with a squash merge.",
+              [("owner", "string"), ("repo", "string"),
+               ("pull_number", "integer")],
+              ["owner", "repo", "pull_number"]),
 ]
+
+
+# MCP synonym table: each canonical argument name maps to the aliases
+# clients use. _mcp_norm folds any of them into the canonical name.
+_MCP_SYNONYMS = {
+    "owner": ("owner", "username", "user"),
+    "repo": ("repo", "repository", "repository_name", "repo_name"),
+    "title": ("title", "name"),
+    "head": ("head", "head_branch", "head_ref", "headrefname"),
+    "base": ("base", "base_branch", "base_ref", "baserefname"),
+    "pull_number": ("pull_number", "number", "pr_number", "pullnumber"),
+    "state": ("state",),
+    "description": ("description",),
+    "private": ("private",),
+    "body": ("body",),
+    "id": ("id",),
+}
+_MCP_ALIAS_TO_CANON = {}
+for _canon, _aliases in _MCP_SYNONYMS.items():
+    for _alias in _aliases:
+        _MCP_ALIAS_TO_CANON[_alias] = _canon
 
 
 def _mcp_norm(args):
@@ -2365,33 +2591,20 @@ def _mcp_norm(args):
         return out
     for key, val in args.items():
         lk = str(key).lower()
-        if lk in ("owner", "username", "user"):
-            out.setdefault("owner", val)
-        elif lk in ("repo", "repository", "repository_name", "repo_name"):
-            out.setdefault("repo", val)
-        elif lk == "full_name" and isinstance(val, str) and "/" in val:
+        if lk == "full_name" and isinstance(val, str) and "/" in val:
             o, r = val.split("/", 1)
             out.setdefault("owner", o)
             out.setdefault("repo", r)
-        elif lk in ("title", "name"):
-            out.setdefault("title", val)
+            continue
+        canon = _MCP_ALIAS_TO_CANON.get(lk)
+        if canon is None:
+            continue
+        out.setdefault(canon, val)
+        if canon == "title":
+            # "title" and "name" are interchangeable: either one fills
+            # both, so create_repo's required "name" is satisfied by a
+            # "title" argument too.
             out.setdefault("name", val)
-        elif lk == "body":
-            out["body"] = val
-        elif lk in ("head", "head_branch", "head_ref", "headrefname"):
-            out["head"] = val
-        elif lk in ("base", "base_branch", "base_ref", "baserefname"):
-            out["base"] = val
-        elif lk in ("pull_number", "number", "pr_number", "pullnumber"):
-            out["pull_number"] = val
-        elif lk == "state":
-            out["state"] = val
-        elif lk == "description":
-            out["description"] = val
-        elif lk == "private":
-            out["private"] = val
-        elif lk == "id":
-            out["id"] = val
     return out
 
 
@@ -2412,82 +2625,115 @@ def _mcp_missing(required, args):
     return None
 
 
+def _mcp_repo_or_error(args):
+    """(repo, error_result) for a call naming owner/repo."""
+    repo = STORE.get_repo(args["owner"], args["repo"])
+    if repo is None or args["owner"] != VIEWER_LOGIN:
+        return None, _mcp_error_result("Repository not found")
+    return repo, None
+
+
+def _mcp_create_repo(h, args):
+    missing = _mcp_missing(["name"], args)
+    if missing:
+        return missing, None
+    name = args["name"]
+    if STORE.get_repo(VIEWER_LOGIN, name) is not None:
+        return _mcp_error_result("Repository already exists"), None
+    repo = STORE.create_repo(name, args.get("description") or "",
+                             bool(args.get("private")))
+    return _mcp_text_result(_repo_json(repo)), None
+
+
+def _mcp_get_repo(h, args):
+    missing = _mcp_missing(["owner", "repo"], args)
+    if missing:
+        return missing, None
+    repo, err = _mcp_repo_or_error(args)
+    if err:
+        return err, None
+    return _mcp_text_result(_repo_json(repo)), None
+
+
+def _mcp_create_issue(h, args):
+    missing = _mcp_missing(["owner", "repo", "title"], args)
+    if missing:
+        return missing, None
+    repo, err = _mcp_repo_or_error(args)
+    if err:
+        return err, None
+    iss = _gql_create_issue(repo, args["title"], args.get("body") or "")
+    return _mcp_text_result(h._issue_json(repo, iss)), None
+
+
+def _mcp_list_issues(h, args):
+    missing = _mcp_missing(["owner", "repo"], args)
+    if missing:
+        return missing, None
+    repo, err = _mcp_repo_or_error(args)
+    if err:
+        return err, None
+    state = str(args.get("state") or "open").lower()
+    items = [h._issue_json(repo, i) for i in repo.issues.values()
+             if state == "all" or i["state"] == state]
+    items.sort(key=lambda x: x["number"])
+    return _mcp_text_result({"issues": items}), None
+
+
+def _mcp_create_pull(h, args):
+    missing = _mcp_missing(["owner", "repo", "title", "head", "base"], args)
+    if missing:
+        return missing, None
+    repo, err = _mcp_repo_or_error(args)
+    if err:
+        return err, None
+    try:
+        pr = _gql_create_pull(repo, args["title"], args["head"],
+                              args["base"])
+    except ValueError as exc:
+        return _mcp_error_result(str(exc)), None
+    return _mcp_text_result(h._pr_json(repo, pr)), None
+
+
+def _mcp_merge_pull(h, args):
+    missing = _mcp_missing(["owner", "repo", "pull_number"], args)
+    if missing:
+        return missing, None
+    repo, err = _mcp_repo_or_error(args)
+    if err:
+        return err, None
+    try:
+        number = int(args["pull_number"])
+    except (TypeError, ValueError):
+        return _mcp_error_result("Invalid pull_number"), None
+    pr = repo.pulls.get(number)
+    if pr is None:
+        return _mcp_error_result("Pull request not found"), None
+    try:
+        sha = _gql_squash_merge(repo, pr)
+    except ValueError as exc:
+        return _mcp_error_result(str(exc)), None
+    return _mcp_text_result({"sha": sha, "merged": True,
+                             "message": "Pull request merged",
+                             "number": number}), None
+
+
+_MCP_TOOL_HANDLERS = {
+    "create_repo": _mcp_create_repo,
+    "get_repo": _mcp_get_repo,
+    "create_issue": _mcp_create_issue,
+    "list_issues": _mcp_list_issues,
+    "create_pull_request": _mcp_create_pull,
+    "merge_pull_request": _mcp_merge_pull,
+}
+
+
 def _mcp_call(h, name, raw_args):
     args = _mcp_norm(raw_args)
-    if name == "create_repo":
-        missing = _mcp_missing(["name"], args)
-        if missing:
-            return missing, None
-        name = args["name"]
-        if STORE.get_repo(VIEWER_LOGIN, name) is not None:
-            return _mcp_error_result("Repository already exists"), None
-        repo = STORE.create_repo(name, args.get("description") or "",
-                                 bool(args.get("private")))
-        return _mcp_text_result(_repo_json(repo)), None
-    if name == "get_repo":
-        missing = _mcp_missing(["owner", "repo"], args)
-        if missing:
-            return missing, None
-        repo = STORE.get_repo(args["owner"], args["repo"])
-        if repo is None or args["owner"] != VIEWER_LOGIN:
-            return _mcp_error_result("Repository not found"), None
-        return _mcp_text_result(_repo_json(repo)), None
-    if name == "create_issue":
-        missing = _mcp_missing(["owner", "repo", "title"], args)
-        if missing:
-            return missing, None
-        repo = STORE.get_repo(args["owner"], args["repo"])
-        if repo is None or args["owner"] != VIEWER_LOGIN:
-            return _mcp_error_result("Repository not found"), None
-        iss = _gql_create_issue(repo, args["title"], args.get("body") or "")
-        return _mcp_text_result(h._issue_json(repo, iss)), None
-    if name == "list_issues":
-        missing = _mcp_missing(["owner", "repo"], args)
-        if missing:
-            return missing, None
-        repo = STORE.get_repo(args["owner"], args["repo"])
-        if repo is None or args["owner"] != VIEWER_LOGIN:
-            return _mcp_error_result("Repository not found"), None
-        state = str(args.get("state") or "open").lower()
-        items = [h._issue_json(repo, i) for i in repo.issues.values()
-                 if state == "all" or i["state"] == state]
-        items.sort(key=lambda x: x["number"])
-        return _mcp_text_result({"issues": items}), None
-    if name == "create_pull_request":
-        missing = _mcp_missing(["owner", "repo", "title", "head", "base"], args)
-        if missing:
-            return missing, None
-        repo = STORE.get_repo(args["owner"], args["repo"])
-        if repo is None or args["owner"] != VIEWER_LOGIN:
-            return _mcp_error_result("Repository not found"), None
-        try:
-            pr = _gql_create_pull(repo, args["title"], args["head"],
-                                  args["base"])
-        except ValueError as exc:
-            return _mcp_error_result(str(exc)), None
-        return _mcp_text_result(h._pr_json(repo, pr)), None
-    if name == "merge_pull_request":
-        missing = _mcp_missing(["owner", "repo", "pull_number"], args)
-        if missing:
-            return missing, None
-        repo = STORE.get_repo(args["owner"], args["repo"])
-        if repo is None or args["owner"] != VIEWER_LOGIN:
-            return _mcp_error_result("Repository not found"), None
-        try:
-            number = int(args["pull_number"])
-        except (TypeError, ValueError):
-            return _mcp_error_result("Invalid pull_number"), None
-        pr = repo.pulls.get(number)
-        if pr is None:
-            return _mcp_error_result("Pull request not found"), None
-        try:
-            sha = _gql_squash_merge(repo, pr)
-        except ValueError as exc:
-            return _mcp_error_result(str(exc)), None
-        return _mcp_text_result({"sha": sha, "merged": True,
-                                 "message": "Pull request merged",
-                                 "number": number}), None
-    return None, {"code": -32602, "message": "Unknown tool: %s" % name}
+    handler = _MCP_TOOL_HANDLERS.get(name)
+    if handler is None:
+        return None, {"code": -32602, "message": "Unknown tool: %s" % name}
+    return handler(h, args)
 
 
 def _mcp_dispatch(h, method, params):
@@ -2576,12 +2822,13 @@ def _git_info_refs(h, repo, service):
     v2 = (service == "git-upload-pack"
           and h.headers.get("Git-Protocol") == "version=2")
     if v2:
-        body = (pkt(b"version 2\n")
-                + pkt(b"ls-refs=unborn\n")
-                + pkt(b"fetch=shallow filter\n")
-                + pkt(b"object-format=sha1\n")
-                + pkt(("agent=%s\n" % AGENT).encode())
-                + pkt_flush())
+        body = b"".join([
+            pkt(b"version 2\n"),
+            pkt(b"ls-refs=unborn\n"),
+            pkt(b"fetch=shallow filter\n"),
+            pkt(b"object-format=sha1\n"),
+            pkt(("agent=%s\n" % AGENT).encode()),
+            pkt_flush()])
         h._send(200, body, content_type="application/x-git-upload-pack-"
                                         "advertisement")
         return
@@ -2594,15 +2841,16 @@ def _git_info_refs(h, repo, service):
                 "symref=HEAD:refs/heads/main agent=%s" % AGENT)
         ctype = "application/x-git-receive-pack-advertisement"
     head, lines = _git_ref_lines(repo)
-    out = pkt(("# service=%s\n" % service).encode()) + pkt_flush()
+    parts = [pkt(("# service=%s\n" % service).encode()), pkt_flush()]
     if not lines:
-        out += pkt(("%s capabilities^{}\x00%s\n" % (ZERO_OID, caps)).encode())
+        parts.append(pkt(("%s capabilities^{}\x00%s\n"
+                          % (ZERO_OID, caps)).encode()))
     else:
-        out += pkt(("%s\x00%s\n" % (head, caps)).encode())
+        parts.append(pkt(("%s\x00%s\n" % (head, caps)).encode()))
         for line in lines:
-            out += pkt(line.encode() + b"\n")
-    out += pkt_flush()
-    h._send(200, out, content_type=ctype)
+            parts.append(pkt(line.encode() + b"\n"))
+    parts.append(pkt_flush())
+    h._send(200, b"".join(parts), content_type=ctype)
 
 
 def _have_closure(repo, haves, old_shallow):
@@ -2620,22 +2868,30 @@ def _have_closure(repo, haves, old_shallow):
         if obj is None:
             continue
         seen.add(oid)
-        otype, data = obj
+        otype = obj[0]
         if otype == "commit":
-            parsed = parse_commit(data)
-            stack.append(parsed["tree"])
-            if oid not in shallow_set:
-                stack.extend(parsed["parents"])
+            parsed = commit_of(repo, oid)
+            if parsed is not None:
+                stack.append(parsed["tree"])
+                if oid not in shallow_set:
+                    stack.extend(parsed["parents"])
         elif otype == "tag":
-            stack.append(parse_tag(data)["object"])
+            t = tag_of(repo, oid)
+            if t is not None and t["object"]:
+                stack.append(t["object"])
         elif otype == "tree":
-            for _mode, _name, child in parse_tree(data):
+            for _mode, _name, child in tree_of(repo, oid):
                 stack.append(child)
     return seen
 
 
 def _git_fetch_objects(repo, wants, haves, depth, old_shallow):
-    """Objects to send for a fetch, plus shallow/unshallow boundary lists."""
+    """Objects to send for a fetch, plus shallow/unshallow boundary lists.
+
+    The BFS is depth-limited: with a deepen limit it only ever walks as far
+    as the fetch can send, so a depth-1 clone of a 200-commit history visits
+    one commit instead of all 200. Parsed commits come from the memo, so a
+    repeated fetch of the same tip costs almost nothing."""
     want_commits = []
     extra = {}
     for want in wants:
@@ -2649,22 +2905,27 @@ def _git_fetch_objects(repo, wants, haves, depth, old_shallow):
                 want_commits.append(commit)
         elif obj[0] == "commit":
             want_commits.append(want)
-    # BFS distances from the wants (0 = want itself, 1 = parent, ...)
+    # BFS distances from the wants (0 = want itself, 1 = parent, ...).
+    # Never enqueue a parent deeper than the fetch can include.
     dist = {}
     queue = [(c, 0) for c in want_commits]
     qi = 0
+    limit = depth
     while qi < len(queue):
         commit, d = queue[qi]
         qi += 1
         if commit in dist:
             continue
         dist[commit] = d
-        obj = repo.get_object(commit)
-        if obj is None or obj[0] != "commit":
+        if limit is not None and d >= limit - 1:
             continue
-        for parent in parse_commit(obj[1])["parents"]:
+        parsed = commit_of(repo, commit)
+        if parsed is None:
+            continue
+        nd = d + 1
+        for parent in parsed["parents"]:
             if parent not in dist:
-                queue.append((parent, d + 1))
+                queue.append((parent, nd))
     if depth is None:
         included = set(dist)
     else:
@@ -2674,42 +2935,61 @@ def _git_fetch_objects(repo, wants, haves, depth, old_shallow):
     for oid, obj in extra.items():
         if oid not in have_closure:
             send[oid] = obj
+    get_object = repo.get_object
     for commit in included:
         if commit in have_closure:
             continue
-        obj = repo.get_object(commit)
+        obj = get_object(commit)
         if obj is None:
             continue
         send[commit] = obj
-        tree = parse_commit(obj[1])["tree"]
-        for oid in reachable(repo, [tree]):
+        parsed = commit_of(repo, commit)
+        if parsed is None:
+            continue
+        for oid in reachable(repo, [parsed["tree"]]):
             if oid not in have_closure and oid not in send:
-                send[oid] = repo.get_object(oid)
+                send[oid] = get_object(oid)
     shallow = []
     unshallow = []
     if depth is not None:
         for commit, d in dist.items():
             if d == depth - 1 and commit in included:
-                obj = repo.get_object(commit)
-                if obj is not None and obj[0] == "commit":
-                    if parse_commit(obj[1])["parents"]:
-                        shallow.append(commit)
+                parsed = commit_of(repo, commit)
+                if parsed is not None and parsed["parents"]:
+                    shallow.append(commit)
         for boundary in (old_shallow or []):
-            obj = repo.get_object(boundary)
-            if obj is None or obj[0] != "commit":
+            parsed = commit_of(repo, boundary)
+            if parsed is None:
                 continue
-            if any(p in send
-                   for p in parse_commit(obj[1])["parents"]):
+            if any(p in send for p in parsed["parents"]):
                 unshallow.append(boundary)
     return send, sorted(shallow), sorted(unshallow)
 
 
+def _git_fetch_pack(repo, wants, haves, depth, old_shallow):
+    """(pack_bytes, shallow, unshallow) for a fetch, memoized on its inputs.
+
+    A fetch's output is a pure function of its inputs over immutable
+    objects, so the cache key (wants, haves, depth, old_shallow) is
+    complete: a new tip is a new key, and a repeated clone of the same tip
+    reuses the same pack bytes. Returns the pack already serialized."""
+    key = (tuple(wants), tuple(sorted(haves)), depth,
+           tuple(sorted(old_shallow or [])))
+    hit = repo._fetch_cache.get(key)
+    if hit is not None:
+        return hit
+    send, shallow, unshallow = _git_fetch_objects(
+        repo, wants, haves, depth, old_shallow)
+    pack = write_pack([obj for _oid, obj in sorted(send.items())]) if send else b""
+    out = (pack, shallow, unshallow)
+    repo._fetch_cache[key] = out
+    return out
+
+
 def _git_sideband_pack(pack):
-    out = bytearray()
-    for off in range(0, len(pack), 32768):
-        chunk = pack[off:off + 32768]
-        out += pkt(b"\x01" + chunk)
-    return bytes(out)
+    chunks = [pkt(b"\x01" + pack[off:off + 32768])
+              for off in range(0, len(pack), 32768)]
+    return b"".join(chunks)
 
 
 def _git_upload_pack_v2(h, repo, lines):
@@ -2745,49 +3025,45 @@ def _git_upload_pack_v2(h, repo, lines):
             except ValueError:
                 depth = None
     if command == "ls-refs":
-        out = bytearray()
+        parts = []
         tip = repo.tip()
         if not prefixes:
             if tip is not None:
-                out += pkt(("%s HEAD symref-target:refs/heads/main\n" % tip).encode())
+                parts.append(pkt(("%s HEAD symref-target:refs/heads/main\n"
+                                  % tip).encode()))
             else:
-                out += pkt(b"unborn HEAD symref-target:refs/heads/main\n")
+                parts.append(pkt(b"unborn HEAD symref-target:refs/heads/main\n"))
         for name, oid in sorted(repo.refs.items()):
             if prefixes and not any(name.startswith(p) for p in prefixes):
                 continue
             line = ("%s %s" % (oid, name)).encode()
-            if symrefs and name == "refs/heads/" + repo.default_branch:
-                pass
             if peel:
                 obj = repo.get_object(oid)
                 if obj is not None and obj[0] == "tag":
                     commit = peel_to_commit(repo, oid)
                     if commit is not None:
                         line += (" peeled:%s" % commit).encode()
-            out += pkt(line + b"\n")
-        out += pkt_flush()
-        h._send(200, bytes(out),
+            parts.append(pkt(line + b"\n"))
+        parts.append(pkt_flush())
+        h._send(200, b"".join(parts),
                 content_type="application/x-git-upload-pack-result")
         return
     if command == "fetch":
-        send, shallow, unshallow = _git_fetch_objects(
+        pack, shallow, unshallow = _git_fetch_pack(
             repo, wants, haves, depth, old_shallow)
-        out = bytearray()
-        out += pkt(b"acknowledgments\n") + pkt(b"NAK\n") + pkt_delim()
+        parts = [pkt(b"acknowledgments\n"), pkt(b"NAK\n"), pkt_delim()]
         if depth is not None or old_shallow:
-            out += pkt(b"shallow-info\n")
+            parts.append(pkt(b"shallow-info\n"))
             for oid in shallow:
-                out += pkt(("shallow %s\n" % oid).encode())
+                parts.append(pkt(("shallow %s\n" % oid).encode()))
             for oid in unshallow:
-                out += pkt(("unshallow %s\n" % oid).encode())
-            out += pkt_delim()
-        if send:
-            items = sorted(send.items())
-            pack = write_pack([obj for _oid, obj in items])
-            out += pkt(b"packfile\n")
-            out += _git_sideband_pack(pack)
-        out += pkt_flush()
-        h._send(200, bytes(out),
+                parts.append(pkt(("unshallow %s\n" % oid).encode()))
+            parts.append(pkt_delim())
+        if pack:
+            parts.append(pkt(b"packfile\n"))
+            parts.append(_git_sideband_pack(pack))
+        parts.append(pkt_flush())
+        h._send(200, b"".join(parts),
                 content_type="application/x-git-upload-pack-result")
         return
     raise ValueError("unknown v2 command: %s" % command)
@@ -2822,21 +3098,49 @@ def _git_upload_pack(h, repo):
                 depth = int(line.split()[1])
             except ValueError:
                 depth = None
-    send, shallow, unshallow = _git_fetch_objects(
+    pack, shallow, unshallow = _git_fetch_pack(
         repo, wants, haves, depth, old_shallow)
-    out = bytearray()
-    out += pkt(b"NAK\n")
+    parts = [pkt(b"NAK\n")]
     for oid in shallow:
-        out += pkt(("shallow %s\n" % oid).encode())
+        parts.append(pkt(("shallow %s\n" % oid).encode()))
     for oid in unshallow:
-        out += pkt(("unshallow %s\n" % oid).encode())
-    if send:
-        items = sorted(send.items())
-        pack = write_pack([obj for _oid, obj in items])
-        out += _git_sideband_pack(pack)
-    out += pkt_flush()
-    h._send(200, bytes(out),
+        parts.append(pkt(("unshallow %s\n" % oid).encode()))
+    if pack:
+        parts.append(_git_sideband_pack(pack))
+    parts.append(pkt_flush())
+    h._send(200, b"".join(parts),
             content_type="application/x-git-upload-pack-result")
+
+
+def _apply_ref_update(repo, old, new, ref):
+    """Apply one receive-pack ref update; returns the report line."""
+    if not ref.startswith("refs/"):
+        return "ng %s invalid ref" % ref
+    current = repo.refs.get(ref)
+    if new == ZERO_OID:
+        if current is None:
+            return "ng %s no such ref" % ref
+        del repo.refs[ref]
+        return "ok %s" % ref
+    if old == ZERO_OID:
+        if current is not None:
+            return "ng %s already exists" % ref
+        if repo.get_object(new) is None:
+            return "ng %s object not found" % ref
+        repo.refs[ref] = new
+        return "ok %s" % ref
+    if current is None:
+        return "ng %s no such ref" % ref
+    if current != old:
+        return "ng %s non-fast-forward" % ref
+    if repo.get_object(new) is None:
+        return "ng %s object not found" % ref
+    if new == old:
+        return "ok %s" % ref
+    if not is_ancestor(repo, old, new):
+        return "ng %s non-fast-forward" % ref
+    repo.refs[ref] = new
+    return "ok %s" % ref
 
 
 def _git_receive_pack(h, repo):
@@ -2872,49 +3176,16 @@ def _git_receive_pack(h, repo):
             return
     report.append("unpack ok")
     for old, new, ref in commands:
-        if not ref.startswith("refs/"):
-            report.append("ng %s invalid ref" % ref)
-            continue
-        current = repo.refs.get(ref)
-        if new == ZERO_OID:
-            if current is None:
-                report.append("ng %s no such ref" % ref)
-            else:
-                del repo.refs[ref]
-                report.append("ok %s" % ref)
-            continue
-        if old == ZERO_OID:
-            if current is not None:
-                report.append("ng %s already exists" % ref)
-            elif repo.get_object(new) is None:
-                report.append("ng %s object not found" % ref)
-            else:
-                repo.refs[ref] = new
-                report.append("ok %s" % ref)
-            continue
-        if current is None:
-            report.append("ng %s no such ref" % ref)
-        elif current != old:
-            report.append("ng %s non-fast-forward" % ref)
-        elif repo.get_object(new) is None:
-            report.append("ng %s object not found" % ref)
-        elif new == old:
-            report.append("ok %s" % ref)
-        elif not is_ancestor(repo, old, new):
-            report.append("ng %s non-fast-forward" % ref)
-        else:
-            repo.refs[ref] = new
-            report.append("ok %s" % ref)
+        report.append(_apply_ref_update(repo, old, new, ref))
     _git_send_report(h, report)
 
 
 def _git_send_report(h, lines):
     data = b"".join(pkt((line + "\n").encode()) for line in lines)
-    out = bytearray()
-    for off in range(0, len(data), 32768):
-        out += pkt(b"\x01" + data[off:off + 32768])
-    out += pkt_flush()
-    h._send(200, bytes(out),
+    chunks = [pkt(b"\x01" + data[off:off + 32768])
+              for off in range(0, len(data), 32768)]
+    chunks.append(pkt_flush())
+    h._send(200, b"".join(chunks),
             content_type="application/x-git-receive-pack-result")
 
 
@@ -2933,18 +3204,20 @@ def _git(h, method, owner, repo_name, rest, query):
                 h.send_error_json(400, "Unknown service")
                 return
             _git_info_refs(h, repo, service)
-        elif rest == "/git-upload-pack" and method == "POST":
+            return
+        if rest == "/git-upload-pack" and method == "POST":
             if repo is None:
                 h.send_error_json(404, "Not Found")
                 return
             _git_upload_pack(h, repo)
-        elif rest == "/git-receive-pack" and method == "POST":
+            return
+        if rest == "/git-receive-pack" and method == "POST":
             if repo is None:
                 h.send_error_json(404, "Not Found")
                 return
             _git_receive_pack(h, repo)
-        else:
-            h.send_error_json(404, "Not Found")
+            return
+        h.send_error_json(404, "Not Found")
     except Exception as exc:
         try:
             h._send(400, ("bad request: %s" % exc).encode(),
@@ -2968,8 +3241,9 @@ class Server(ThreadingHTTPServer):
 
 def _http_post_json(url, payload, timeout=30):
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data, method="POST",
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.status, resp.read()
 
@@ -2980,38 +3254,49 @@ def _http_get_json(url, timeout=30):
         return resp.status, resp.read()
 
 
-def _register(port):
-    url = ENV_URL.rstrip("/") + "/register"
+def _retry_loop(fn, is_done):
+    """Call fn() until is_done(status, body) is true, backing off on
+    failure. Used for the env's register/done handshake."""
     delay = 0.25
     while True:
         try:
-            status, _body = _http_post_json(url, {"port": port})
-            if status in (200, 201, 409):
+            status, body = fn()
+            if is_done(status, body):
                 return
-            raise RuntimeError("register returned %d" % status)
         except Exception as exc:
             if "register returned 4" in str(exc):
                 raise
-            delay = min(delay * 2, 2.0)
-            time.sleep(delay)
+        delay = min(delay * 2, 2.0)
+        time.sleep(delay)
+
+
+def _register(port):
+    url = ENV_URL.rstrip("/") + "/register"
+
+    def attempt():
+        status, _body = _http_post_json(url, {"port": port})
+        if status not in (200, 201, 409):
+            raise RuntimeError("register returned %d" % status)
+        return status, _body
+
+    _retry_loop(attempt, lambda status, _body: status in (200, 201, 409))
 
 
 def _wait_done():
     url = ENV_URL.rstrip("/") + "/done"
-    delay = 0.25
-    while True:
+
+    def attempt():
+        return _http_get_json(url)
+
+    def done(status, body):
+        if status != 200:
+            return False
         try:
-            status, body = _http_get_json(url)
-            if status == 200:
-                try:
-                    if json.loads(body.decode("utf-8")).get("done"):
-                        return
-                except (ValueError, TypeError):
-                    pass
-        except Exception:
-            pass
-        delay = min(delay * 2, 2.0)
-        time.sleep(delay)
+            return bool(json.loads(body.decode("utf-8")).get("done"))
+        except (ValueError, TypeError):
+            return False
+
+    _retry_loop(attempt, done)
 
 
 def main():
