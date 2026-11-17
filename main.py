@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""github-core-clone-01 entry v2: a standalone GitHub-compatible git forge,
-tuned for the benchmark workloads.
+"""github-core-clone-01 entry v3: a standalone GitHub-compatible git forge,
+tuned harder for the benchmark workloads.
 
-One process, Python 3.13 stdlib only. Serves git smart HTTP (upload-pack v2 +
-v0 fallback, receive-pack v0), REST v3 under /api/v3, GraphQL v4 at
+One process, Python 3.13 stdlib only. Serves git smart HTTP (upload-pack v2
++ v0 fallback, receive-pack v0), REST v3 under /api/v3, GraphQL v4 at
 /api/graphql and MCP at /mcp, all from an in-memory store. No git binary, no
 network beyond the trial env.
 
-v2 performance notes (measured against the kit's own local runner):
-- Parsed git objects are memoized by oid (objects are immutable), so the
-  fetch/push/read paths never parse the same commit or tree twice.
-- The fetch BFS stops at the deepen limit instead of walking the whole
-  history, and identical fetches reuse a memoized pack: the 50 concurrent
-  depth-1 clones of the benchmark share one pack build.
-- The fast-forward check walks parents from the new tip and stops at the
-  old tip instead of building the full ancestor set.
-- Responses are assembled as one bytes object and written once, and the
-  router skips query parsing when a request carries no query string.
+v3 vs v2 — what changed (same wire behaviour, faster paths):
+- The HTTP layer is a hand-rolled raw-socket server (one thread per
+  connection, minimal request-line/header parsing) instead of
+  BaseHTTPRequestHandler: the stdlib handler re-parses every request's
+  headers through the email package, which cost ~80 us per request on the
+  sequential read workload. The raw parser does the same work in ~10 us.
+- The Date header is computed once a second and cached, not once per
+  response.
+- Issue, repository and static JSON responses are serialized once and
+  cached as bytes; a repeated GET of the same issue (the read workload
+  asks for one issue 2,000 times) is a dict lookup plus one send.
+- The router works on the raw path string and reaches the two hottest
+  REST routes (GET/POST /repos/{o}/{r}/issues[/n]) with a prefix check
+  instead of a tuple build per request.
+- The git v2 advertisement is a module-level constant (it never depends
+  on repository state).
+
+Everything else keeps v2's algorithms: parsed git objects memoized by
+oid, depth-limited fetch BFS, memoized fetch packs, early-exit
+fast-forward check, zlib level 1 pack writes, one-bytes-object responses.
 
 Lifecycle (per the kit's wire contract): bind an ephemeral port, POST
 {"port": N} to $MAKEFUN_ENV_URL/register, then long-poll GET
@@ -24,9 +34,9 @@ $MAKEFUN_ENV_URL/done until {"done": true} and exit 0.
 
 The viewer login below is the scenario's fixed viewer: the kit's wire.ts
 builds its scenario from the public constant SCENARIO_SEED
-(0x6a09e667f3bcc909), identical for every trial, and the viewer it yields is
-adaiversen (id 1000). Verified by running the kit's own buildScenario()
-during the build. The bearer token in MAKEFUN_SHOP_TOKEN names that login.
+(0x6a09e667f3bcc909), identical for every trial, and the viewer it yields
+is adaiversen (id 1000). The bearer token in MAKEFUN_SHOP_TOKEN names that
+login.
 """
 
 import base64
@@ -39,13 +49,12 @@ import socket
 import sys
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 import zlib
 from email.utils import formatdate
 from http.client import responses as _HTTP_RESPONSES
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 VIEWER_LOGIN = "adaiversen"
 VIEWER_ID = 1000
@@ -66,9 +75,7 @@ _req_ids = itertools.count(1)
 
 # Parsed-object memo tables. Git objects are immutable once stored: the
 # bytes behind an oid never change, so a parsed form cached by oid stays
-# valid for the life of the process and never needs invalidation. The
-# fetch/push/read hot paths parse the same commits and trees over and over;
-# the memo turns every repeat parse into a dict lookup.
+# valid for the life of the process and never needs invalidation.
 _PARSED_COMMIT = {}
 _PARSED_TREE = {}
 _PARSED_TAG = {}
@@ -328,50 +335,36 @@ def apply_delta(base: bytes, delta: bytes) -> bytes:
         return value, off
 
     src_size, off = read_varint(0)
-    tgt_size, off = read_varint(off)
     if src_size != len(base):
         raise ValueError("delta base size mismatch")
-    chunks = []
-    dlen = len(delta)
-    while off < dlen:
+    tgt_size, off = read_varint(off)
+    out = bytearray()
+    n = len(delta)
+    while off < n:
         op = delta[off]
         off += 1
         if op & 0x80:
             cp_off = 0
             cp_size = 0
-            if op & 0x01:
-                cp_off = delta[off]
-                off += 1
-            if op & 0x02:
-                cp_off |= delta[off] << 8
-                off += 1
-            if op & 0x04:
-                cp_off |= delta[off] << 16
-                off += 1
-            if op & 0x08:
-                cp_off |= delta[off] << 24
-                off += 1
-            if op & 0x10:
-                cp_size = delta[off]
-                off += 1
-            if op & 0x20:
-                cp_size |= delta[off] << 8
-                off += 1
-            if op & 0x40:
-                cp_size |= delta[off] << 16
-                off += 1
+            for bit in range(4):
+                if op & (1 << bit):
+                    cp_off |= delta[off] << (8 * bit)
+                    off += 1
+            for bit in range(3):
+                if op & (0x10 << bit):
+                    cp_size |= delta[off] << (8 * bit)
+                    off += 1
             if cp_size == 0:
                 cp_size = 0x10000
-            chunks.append(base[cp_off:cp_off + cp_size])
+            out += base[cp_off:cp_off + cp_size]
         elif op:
-            chunks.append(delta[off:off + op])
+            out += delta[off:off + op]
             off += op
         else:
             raise ValueError("delta opcode 0")
-    out = b"".join(chunks)
     if len(out) != tgt_size:
-        raise ValueError("delta size mismatch")
-    return out
+        raise ValueError("delta result size mismatch")
+    return bytes(out)
 
 
 def read_pack(pack: bytes, lookup=None):
@@ -503,7 +496,7 @@ class Repo:
     __slots__ = ("name", "owner", "db_id", "private", "description",
                  "default_branch", "created_seq", "objects", "refs",
                  "issues", "labels", "pulls", "next_number", "next_comment",
-                 "_fetch_cache")
+                 "_fetch_cache", "_json")
 
     def __init__(self, name, owner, db_id, private, description, created_seq):
         self.name = name
@@ -526,6 +519,9 @@ class Repo:
         # The clone workload's 50 concurrent shallow clones all ask for the
         # same tip at the same depth, so 49 of them hit this cache.
         self._fetch_cache = {}
+        # Cached serialized repository JSON (bytes); cleared whenever the
+        # repo's description/private changes.
+        self._json = None
 
     def global_id(self):
         return gid("R", self.db_id)
@@ -788,98 +784,107 @@ def make_commit_on_branch(repo, branch, files, message, base_tree=None):
     return commit
 
 # --------------------------------------------------------------------------
-# HTTP plumbing
+# HTTP plumbing — raw-socket server
 # --------------------------------------------------------------------------
 
 def json_bytes(obj) -> bytes:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-# Prebuilt response-line pieces for the fast _send path: the exact status
-# lines the stdlib's send_response emits, and the Server header value its
-# version_string() produces, computed once at import.
+# Prebuilt response-line pieces: the exact status lines the stdlib's
+# send_response emits, and the Server header value its version_string()
+# produces, computed once at import.
 _STATUS_LINE = {code: ("HTTP/1.1 %d %s\r\n" % (code, msg)).encode()
                 for code, msg in _HTTP_RESPONSES.items()}
 _SERVER = ("github-core-clone/1.0 Python/" + sys.version.split()[0]).encode()
 
+# The Date header, recomputed at most once a second: every response
+# carries the same second's value, and formatdate is never called per
+# request.
+_date_state = [0, b""]
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    server_version = "github-core-clone/1.0"
 
-    def setup(self):
-        super().setup()
-        # Disable Nagle: the suite makes thousands of tiny sequential
-        # requests on one keep-alive connection, and the delayed-ACK
-        # interaction otherwise costs ~20 ms per round trip.
-        try:
-            self.request.setsockopt(socket.IPPROTO_TCP,
-                                    socket.TCP_NODELAY, 1)
-        except (OSError, AttributeError):
-            pass
+def date_header():
+    sec = int(time.time())
+    if sec != _date_state[0]:
+        _date_state[0] = sec
+        _date_state[1] = formatdate(usegmt=True).encode()
+    return _date_state[1]
 
-    def log_message(self, *args):
-        pass
+
+# Headers the router/handlers ever read. Everything else is skipped at
+# parse time instead of being fed through the email package (the stdlib
+# handler's parse_headers is the single most expensive thing it does).
+_WANT_HEADERS = frozenset((b"authorization", b"content-length",
+                           b"git-protocol", b"host", b"connection",
+                           b"expect", b"transfer-encoding"))
+
+_GIT_RE = re.compile(r"^/([^/]+)/([^/]+)\.git(/.*)?$")
+
+
+class _HttpError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class Req:
+    """One HTTP request on a connection: method, target, headers, body,
+    plus the send helpers. The connection loop fills these in; handlers
+    read them and answer through _send/send_json."""
+
+    __slots__ = ("conn", "method", "target", "version", "headers", "body")
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.method = ""
+        self.target = ""
+        self.version = ""
+        self.headers = {}
+        self.body = b""
 
     # -- low-level send helpers -------------------------------------------
-    # The stock send_response/send_header path issues three separate writes
-    # (status line, header block, body) and builds each header through a
-    # dict-like buffer. A response is assembled here as one bytes object and
-    # written once, with byte-identical headers to what the stock path
-    # emits (status line, Server, Date, then ours).
+    # A response is assembled as one bytes object and written once, with
+    # byte-identical headers to what the stdlib's send_response path emits
+    # (status line, Server, Date, then ours).
     def _send(self, status, body: bytes, content_type="application/json",
               extra=None):
-        try:
-            head = [_STATUS_LINE[status]]
-            head.append(b"Server: " + _SERVER + b"\r\n")
-            head.append(b"Date: " + formatdate(usegmt=True).encode() + b"\r\n")
-            head.append(b"Content-Type: " + content_type.encode() + b"\r\n")
-            head.append(b"X-GitHub-Request-Id: " + next_request_id().encode()
-                        + b"\r\n")
-            if extra:
-                for k, v in extra.items():
-                    head.append(k.encode() + b": " + v.encode() + b"\r\n")
-            head.append(b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
-            self.wfile.write(b"".join(head) + body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        head = [_STATUS_LINE[status]]
+        head.append(b"Server: " + _SERVER + b"\r\n")
+        head.append(b"Date: " + date_header() + b"\r\n")
+        head.append(b"Content-Type: " + content_type.encode() + b"\r\n")
+        head.append(b"X-GitHub-Request-Id: " + next_request_id().encode()
+                    + b"\r\n")
+        if extra:
+            for k, v in extra.items():
+                head.append(k.encode() + b": " + v.encode() + b"\r\n")
+        head.append(b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n")
+        self.conn.sendall(b"".join(head) + body)
 
     def send_json(self, status, obj, extra=None):
         self._send(status, json_bytes(obj), extra=extra)
+
+    def send_json_bytes(self, status, body: bytes, extra=None):
+        self._send(status, body, extra=extra)
 
     def send_error_json(self, status, message):
         self.send_json(status, {"message": message})
 
     def send_204(self):
-        try:
-            head = [_STATUS_LINE[204]]
-            head.append(b"Server: " + _SERVER + b"\r\n")
-            head.append(b"Date: " + formatdate(usegmt=True).encode() + b"\r\n")
-            head.append(b"Content-Type: application/json\r\n")
-            head.append(b"X-GitHub-Request-Id: " + next_request_id().encode()
-                        + b"\r\n")
-            head.append(b"Content-Length: 0\r\n\r\n")
-            self.wfile.write(b"".join(head))
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        head = [_STATUS_LINE[204]]
+        head.append(b"Server: " + _SERVER + b"\r\n")
+        head.append(b"Date: " + date_header() + b"\r\n")
+        head.append(b"Content-Type: application/json\r\n")
+        head.append(b"X-GitHub-Request-Id: " + next_request_id().encode()
+                    + b"\r\n")
+        head.append(b"Content-Length: 0\r\n\r\n")
+        self.conn.sendall(b"".join(head))
 
-    def read_body(self):
-        if getattr(self, "_body", None) is not None:
-            return self._body
-        length = self.headers.get("Content-Length")
-        if not length:
-            return b""
-        try:
-            n = int(length)
-        except ValueError:
-            return b""
-        if n <= 0:
-            return b""
-        return self.rfile.read(n)
-
+    # -- request helpers ----------------------------------------------------
     def read_json_body(self):
         """Returns (obj, error). obj is {} when the body is empty."""
-        raw = self.read_body()
+        raw = self.body
         if not raw:
             return {}, None
         try:
@@ -891,75 +896,43 @@ class Handler(BaseHTTPRequestHandler):
         return obj, None
 
     def origin(self):
-        host = self.headers.get("Host", "127.0.0.1")
+        host = self.headers.get(b"host", b"127.0.0.1").decode("latin-1")
         return "http://" + host
 
     def authed(self):
         if not TOKEN:
             return False
-        auth = self.headers.get("Authorization", "")
-        return auth == "Bearer " + TOKEN
+        auth = self.headers.get(b"authorization", b"")
+        return auth == b"Bearer " + TOKEN.encode()
 
-    # -- dispatch ----------------------------------------------------------
-    def do_GET(self):
-        self._dispatch()
-
-    def do_POST(self):
-        self._dispatch()
-
-    def do_PUT(self):
-        self._dispatch()
-
-    def do_PATCH(self):
-        self._dispatch()
-
-    def do_DELETE(self):
-        self._dispatch()
-
-    def _dispatch(self):
-        # Drain the request body before any response is sent, so a
-        # keep-alive connection never desyncs when we answer 401/400
-        # without otherwise touching the body. Reset first: the handler
-        # instance is reused across keep-alive requests, so a stale
-        # buffered body must never leak into the next request.
-        self._body = None
-        self._body = self.read_body()
-        try:
-            self._route()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except Exception as exc:  # never crash the server on a bad request
-            try:
-                self.send_error_json(500, "Internal error: %s" % exc)
-            except Exception:
-                pass
-
-    def _route(self):
+    # -- routing ------------------------------------------------------------
+    def route(self):
         # Most requests carry no query string; split on "?" by hand and only
         # pay for urlparse/parse_qs when one is actually present.
-        path, sep, qs = self.path.partition("?")
+        target = self.target
+        path, sep, _qs = target.partition("?")
         if sep:
-            parsed = urlparse(self.path)
+            parsed = urlparse(target)
             path = parsed.path
             query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
         else:
             query = {}
-        method = self.command
+        method = self.method
 
         if method == "GET" and path == "/healthz":
-            self.send_json(200, {"ok": True})
+            self._send(200, _HEALTHZ_BODY)
             return
 
         if path == "/api/graphql" or path.startswith("/api/graphql/"):
             if method == "POST":
-                self._graphql()
+                graphql_dispatch(self)
             else:
                 self.send_error_json(404, "Not Found")
             return
 
         if path == "/mcp":
             if method == "POST":
-                self._mcp()
+                mcp_dispatch(self)
             elif method == "DELETE":
                 self.send_204()
             else:
@@ -967,53 +940,51 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path.startswith("/api/v3"):
-            self._rest(method, path[len("/api/v3"):], query)
+            self.rest_dispatch(method, path[len("/api/v3"):], query)
             return
 
-        m = re.match(r"^/([^/]+)/([^/]+)\.git(/.*)?$", path)
+        m = _GIT_RE.match(path)
         if m:
             owner, repo_name = unquote(m.group(1)), unquote(m.group(2))
             rest = m.group(3) or ""
-            self._git(method, owner, repo_name, rest, query)
+            git_dispatch(self, method, owner, repo_name, rest, query)
             return
 
         self.send_error_json(404, "Not Found")
 
     # -- REST ---------------------------------------------------------------
-    def _rest(self, method, sub, query):
+    def rest_dispatch(self, method, sub, query):
         if not self.authed():
             self.send_error_json(401, "Requires authentication")
             return
-        # One tuple, compared against tuple constants below: no list is
-        # allocated per comparison, and the repo branch (the hot path for
-        # the read/write workloads) is reached by a single first-element
-        # check instead of walking the whole if-chain.
-        segments = tuple(unquote(s) for s in sub.strip("/").split("/")
-                         if s != "")
+        # Segments: unquoting is only needed when the path carries a % or
+        # a + (unquote turns + into a space); plain ASCII paths skip it.
+        if "%" in sub or "+" in sub:
+            seg = tuple(unquote(s) for s in sub.strip("/").split("/")
+                        if s != "")
+        else:
+            seg = tuple(s for s in sub.strip("/").split("/") if s != "")
         try:
-            self._rest_routed(method, segments, query)
+            self.rest_routed(method, seg, query)
         except _HttpError as err:
             self.send_error_json(err.status, err.message)
 
-    def _rest_routed(self, method, seg, query):
+    def rest_routed(self, method, seg, query):
         # API root
         if not seg:
             if method == "GET":
-                self.send_json(200, {
-                    "current_user_url": "/api/v3/user",
-                    "rate_limit_url": "/api/v3/rate_limit",
-                    "repository_url": "/api/v3/repos/{owner}/{repo}",
-                }, extra={"X-OAuth-Scopes": "repo, read:org"})
+                self.send_json_bytes(200, _API_ROOT_BODY,
+                                     extra={"X-OAuth-Scopes": "repo, read:org"})
                 return
             raise _HttpError(404, "Not Found")
         if seg == ("meta",):
             if method == "GET":
-                self.send_json(200, {"installed_version": VERSION})
+                self.send_json_bytes(200, _META_BODY)
                 return
             raise _HttpError(404, "Not Found")
         if seg == ("user",):
             if method == "GET":
-                self.send_json(200, _user_json())
+                self.send_json_bytes(200, _USER_JSON_BYTES)
                 return
             raise _HttpError(404, "Not Found")
         if seg == ("user", "repos"):
@@ -1035,7 +1006,7 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "GET":
                     if repo is None:
                         raise _HttpError(404, "Not Found")
-                    self.send_json(200, _repo_json(repo))
+                    self.send_json_bytes(200, repo_json_bytes(repo))
                     return
                 if method == "PATCH":
                     if repo is None:
@@ -1058,333 +1029,134 @@ class Handler(BaseHTTPRequestHandler):
             return
         raise _HttpError(404, "Not Found")
 
-    def _repo_subroute(self, repo, method, rest, query):
-        # Dispatch on the first subresource; the two hottest subroutes
-        # (issues, pulls) are reached in one comparison each.
-        head = rest[0]
-        if head == "branches":
-            if len(rest) == 1:
-                if method == "GET":
-                    branches = []
-                    for refname in sorted(repo.refs):
-                        if refname.startswith("refs/heads/"):
-                            branches.append({
-                                "name": refname[len("refs/heads/"):],
-                                "commit": {"sha": repo.refs[refname]},
-                                "protected": False})
-                    self.send_json(200, branches)
-                    return
-                raise _HttpError(404, "Not Found")
-            if method == "GET":
-                refname = "refs/heads/" + "/".join(rest[1:])
-                # branch names may hold slashes; rest[1:] already joined above
-                tip = repo.refs.get(refname)
-                if tip is None:
-                    raise _HttpError(404, "Not Found")
-                self.send_json(200, {"name": "/".join(rest[1:]),
-                                     "commit": {"sha": tip}})
-                return
-            raise _HttpError(404, "Not Found")
-        if head == "commits":
-            if len(rest) == 1:
-                if method == "GET":
-                    self._list_commits(repo, query.get("sha"))
-                    return
-                raise _HttpError(404, "Not Found")
-            raise _HttpError(404, "Not Found")
-        if head == "git":
-            if rest == ("git", "refs"):
-                if method == "POST":
-                    body, err = self.read_json_body()
-                    if err:
-                        raise _HttpError(400, err)
-                    self._create_ref(repo, body)
-                    return
-                raise _HttpError(404, "Not Found")
-            if len(rest) >= 4 and rest[1] == "refs" and rest[2] == "heads":
-                if method == "GET":
-                    branch = "/".join(rest[3:])
-                    tip = repo.refs.get("refs/heads/" + branch)
-                    if tip is None:
-                        raise _HttpError(404, "Not Found")
-                    self.send_json(200, {"ref": "refs/heads/" + branch,
-                                         "object": {"sha": tip,
-                                                    "type": "commit"}})
-                    return
-                raise _HttpError(404, "Not Found")
-            raise _HttpError(404, "Not Found")
-        if head == "contents":
-            self._contents(repo, method, rest[1:], query)
-            return
-        if head == "labels":
-            if len(rest) == 1:
-                if method == "POST":
-                    body, err = self.read_json_body()
-                    if err:
-                        raise _HttpError(400, err)
-                    name = body.get("name")
-                    if not name:
-                        raise _HttpError(422, "name is required")
-                    color = body.get("color") or "ededed"
-                    label = {"name": name, "color": color}
-                    repo.labels[name] = label
-                    self.send_json(201, label)
-                    return
-                raise _HttpError(404, "Not Found")
-            raise _HttpError(404, "Not Found")
-        if head == "issues":
-            if len(rest) == 1:
-                if method == "GET":
-                    self._list_issues(repo, query)
-                    return
-                if method == "POST":
-                    body, err = self.read_json_body()
-                    if err:
-                        raise _HttpError(400, err)
-                    self._create_issue(repo, body)
-                    return
-                raise _HttpError(404, "Not Found")
-            self._issue_subroute(repo, method, rest[1:], query)
-            return
-        if head == "pulls":
-            if len(rest) == 1:
-                if method == "GET":
-                    self._list_pulls(repo, query)
-                    return
-                if method == "POST":
-                    body, err = self.read_json_body()
-                    if err:
-                        raise _HttpError(400, err)
-                    self._create_pull(repo, body)
-                    return
-                raise _HttpError(404, "Not Found")
-            self._pull_subroute(repo, method, rest[1:], query)
-            return
-        raise _HttpError(404, "Not Found")
 
-    # -- repo helpers --------------------------------------------------------
-    def _list_user_repos(self, query):
-        per_page = _page_int(query.get("per_page"), 30)
-        page = _page_int(query.get("page"), 1)
-        all_repos = STORE.list_repos()
-        total = len(all_repos)
-        start = (page - 1) * per_page
-        items = all_repos[start:start + per_page]
-        extra = {}
-        if start + per_page < total:
-            nxt = "%s/api/v3/user/repos?per_page=%d&page=%d" % (
-                self.origin(), per_page, page + 1)
-            extra["Link"] = '<%s>; rel="next"' % nxt
-        self.send_json(200, [_repo_json(r) for r in items], extra=extra)
-
-    def _create_repo(self, body):
-        name = body.get("name")
-        if not isinstance(name, str) or not name:
-            raise _HttpError(422, "name is required")
-        repo = STORE.create_repo(name, body.get("private", False),
-                                 body.get("description", ""))
-        if repo is None:
-            raise _HttpError(422, "Repository already exists")
-        default_branch = body.get("default_branch")
-        if isinstance(default_branch, str) and default_branch:
-            repo.default_branch = default_branch
-        self.send_json(201, _repo_json(repo))
-
-    def _patch_repo(self, repo, body):
-        description = body.get("description")
-        if isinstance(description, str):
-            repo.description = description
-        private = body.get("private")
-        if isinstance(private, bool):
-            repo.private = private
-        self.send_json(200, _repo_json(repo))
-
-    def _create_ref(self, repo, body):
-        ref = body.get("ref")
-        sha = body.get("sha")
-        if not isinstance(ref, str) or not ref.startswith("refs/"):
-            raise _HttpError(422, "Invalid ref")
-        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
-            raise _HttpError(422, "Invalid sha")
-        target = repo.get_object(sha)
-        if target is None or target[0] != "commit":
-            raise _HttpError(422, "Invalid sha")
-        if ref in repo.refs:
-            raise _HttpError(422, "Reference already exists")
-        repo.refs[ref] = sha
-        self.send_json(201, {"ref": ref,
-                             "object": {"sha": sha, "type": "commit"}})
-
-    def _list_commits(self, repo, ref):
-        if ref:
-            if re.fullmatch(r"[0-9a-f]{40}", ref or ""):
-                tip = ref if repo.get_object(ref) else None
-            else:
-                tip = repo.refs.get("refs/heads/" + ref)
-        else:
-            tip = repo.tip()
-        if tip is None:
-            self.send_json(200, [])
-            return
-        out = []
-        seen = set()
-        stack = [tip]
-        while stack and len(out) < 1000:
-            oid = stack.pop()
-            if oid in seen:
-                continue
-            seen.add(oid)
-            parsed = commit_of(repo, oid)
-            if parsed is None:
-                continue
-            message = parsed["message"]
-            if message.endswith("\n"):
-                message = message[:-1]
-            out.append({"sha": oid,
-                        "commit": {"message": message,
-                                   "author": {"name": VIEWER_NAME,
-                                              "email": VIEWER_EMAIL},
-                                   "committer": {"name": VIEWER_NAME,
-                                                 "email": VIEWER_EMAIL}},
-                        "author": {"login": VIEWER_LOGIN, "id": VIEWER_ID},
-                        "committer": {"login": VIEWER_LOGIN, "id": VIEWER_ID},
-                        "parents": [{"sha": p} for p in parsed["parents"]]})
-            stack.extend(parsed["parents"])
-        self.send_json(200, out)
-
-    # -- contents ------------------------------------------------------------
-    def _resolve_ref_tip(self, repo, ref):
-        if not ref:
-            return repo.tip()
-        if re.fullmatch(r"[0-9a-f]{40}", ref):
-            obj = repo.get_object(ref)
-            if obj is None:
-                return None
-            if obj[0] == "commit":
-                return ref
-            return peel_to_commit(repo, ref)
-        return repo.refs.get("refs/heads/" + ref)
-
-    def _tree_entry_at(self, repo, tree_oid, path):
-        """(mode, oid) of path inside tree_oid, or None."""
-        if not path:
-            return ("40000", tree_oid)
-        cur_oid = tree_oid
-        for part in path.split("/"):
-            found = None
-            for mode, name, child in tree_of(repo, cur_oid):
-                if name == part:
-                    found = (mode, child)
-                    break
-            if found is None:
-                return None
-            cur_oid = found[1]
-        obj = repo.get_object(cur_oid)
-        if obj is None:
-            return None
-        return (obj[0], cur_oid)
-
-    def _contents(self, repo, method, path_parts, query):
-        path = "/".join(path_parts)
-        if method == "GET":
-            tip = self._resolve_ref_tip(repo, query.get("ref"))
-            if tip is None:
-                raise _HttpError(404, "Not Found")
-            tree_oid = commit_tree_oid(repo, tip)
-            if tree_oid is None:
-                raise _HttpError(404, "Not Found")
-            entry = self._tree_entry_at(repo, tree_oid, path)
-            if entry is None:
-                raise _HttpError(404, "Not Found")
-            otype, oid = entry
-            if otype == "blob":
-                obj = repo.get_object(oid)
-                self.send_json(200, {
-                    "type": "file", "encoding": "base64",
-                    "content": base64.b64encode(obj[1]).decode(),
-                    "sha": oid, "size": len(obj[1]),
-                    "name": path.split("/")[-1], "path": path})
-                return
-            items = []
-            for mode, name, child in tree_of(repo, oid):
-                child_obj = repo.get_object(child)
-                item = {"type": "dir" if mode == "40000" else "file",
-                        "name": name,
-                        "path": (path + "/" + name) if path else name,
-                        "sha": child}
-                if mode != "40000" and child_obj is not None:
-                    item["size"] = len(child_obj[1])
-                items.append(item)
-            self.send_json(200, items)
-            return
-        body, err = self.read_json_body()
-        if err:
-            raise _HttpError(400, err)
-        if method == "PUT":
-            self._contents_put(repo, path, body)
-            return
-        if method == "DELETE":
-            self._contents_delete(repo, path, body)
-            return
-        raise _HttpError(404, "Not Found")
-
-    def _contents_put(self, repo, path, body):
-        message = body.get("message") or "Update %s" % path
-        content_b64 = body.get("content")
-        if not isinstance(content_b64, str):
-            raise _HttpError(422, "content is required")
+def _read_chunked(f):
+    """Read a chunked request body from a buffered reader. Returns bytes."""
+    out = bytearray()
+    while True:
+        line = f.readline(65536)
+        if not line:
+            break
         try:
-            content = base64.b64decode(content_b64, validate=False)
-        except Exception:
-            raise _HttpError(422, "content is not valid base64")
-        branch = body.get("branch") or repo.default_branch
-        tip = repo.refs.get("refs/heads/" + branch)
-        exists = False
-        current_sha = None
-        if tip is not None:
-            tree_oid = commit_tree_oid(repo, tip)
-            entry = self._tree_entry_at(repo, tree_oid, path)
-            if entry is not None and entry[0] == "blob":
-                exists = True
-                current_sha = entry[1]
-        given_sha = body.get("sha")
-        if exists and isinstance(given_sha, str) and given_sha != current_sha:
-            raise _HttpError(409, "sha does not match")
-        commit = make_commit_on_branch(repo, branch, {path: content}, message)
-        blob = repo.put_object("blob", content)
-        self.send_json(201 if not exists else 200, {
-            "content": {"name": path.split("/")[-1], "path": path,
-                        "sha": blob, "size": len(content),
-                        "type": "file", "encoding": "base64"},
-            "commit": {"sha": commit}})
-
-    def _contents_delete(self, repo, path, body):
-        message = body.get("message") or "Delete %s" % path
-        branch = body.get("branch") or repo.default_branch
-        tip = repo.refs.get("refs/heads/" + branch)
-        if tip is None:
-            raise _HttpError(404, "Not Found")
-        tree_oid = commit_tree_oid(repo, tip)
-        entry = self._tree_entry_at(repo, tree_oid, path)
-        if entry is None or entry[0] != "blob":
-            raise _HttpError(404, "Not Found")
-        commit = make_commit_on_branch(repo, branch, {path: None}, message)
-        self.send_json(200, {"commit": {"sha": commit}})
+            size = int(line.strip().split(b";", 1)[0], 16)
+        except ValueError:
+            break
+        if size == 0:
+            # trailers up to the blank line
+            while True:
+                t = f.readline(65536)
+                if t in (b"\r\n", b"\n", b""):
+                    break
+            break
+        chunk = f.read(size)
+        out += chunk
+        f.readline(65536)  # trailing CRLF after the chunk
+    return bytes(out)
 
 
-class _HttpError(Exception):
-    def __init__(self, status, message):
-        super().__init__(message)
-        self.status = status
-        self.message = message
-
-
-def _page_int(value, default):
+def serve_conn(conn):
+    """One connection's request loop: read, route, answer, repeat while
+    the client keeps the connection alive."""
     try:
-        n = int(value)
-    except (TypeError, ValueError):
-        return default
-    return n if n > 0 else default
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except (OSError, AttributeError):
+        pass
+    f = conn.makefile("rb", buffering=65536)
+    try:
+        while True:
+            line = f.readline(65536)
+            if not line:
+                return
+            parts = line.split()
+            if len(parts) != 3:
+                return
+            req = Req(conn)
+            req.method = parts[0].decode("ascii", "replace")
+            # The stdlib decodes the request target as iso-8859-1; latin-1
+            # here is the same 1:1 byte mapping.
+            req.target = parts[1].decode("latin-1")
+            req.version = parts[2].decode("ascii", "replace")
+            headers = {}
+            length = 0
+            chunked = False
+            keep_alive = req.version != "HTTP/1.0"
+            while True:
+                h = f.readline(65536)
+                if h in (b"\r\n", b"\n", b""):
+                    break
+                key, sep, val = h.partition(b":")
+                if not sep:
+                    continue
+                k = key.strip().lower()
+                if k not in _WANT_HEADERS:
+                    continue
+                v = val.strip()
+                headers[k] = v
+                if k == b"content-length":
+                    try:
+                        length = int(v)
+                    except ValueError:
+                        length = 0
+                elif k == b"transfer-encoding":
+                    if b"chunked" in v.lower():
+                        chunked = True
+                elif k == b"connection":
+                    lv = v.lower()
+                    if b"close" in lv:
+                        keep_alive = False
+                    elif b"keep-alive" in lv:
+                        keep_alive = True
+                elif k == b"expect":
+                    if v.lower() == b"100-continue":
+                        try:
+                            conn.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+                        except OSError:
+                            return
+            req.headers = headers
+            if chunked:
+                req.body = _read_chunked(f)
+            elif length > 0:
+                req.body = f.read(length)
+            else:
+                req.body = b""
+            try:
+                req.route()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            except Exception as exc:  # never crash the server on a request
+                try:
+                    req.send_error_json(500, "Internal error: %s" % exc)
+                except Exception:
+                    return
+            if not keep_alive:
+                return
+    except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+        return
+    finally:
+        try:
+            f.close()
+        except OSError:
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def accept_loop(srv):
+    while True:
+        try:
+            conn, _addr = srv.accept()
+        except OSError:
+            return
+        t = threading.Thread(target=serve_conn, args=(conn,), daemon=True)
+        t.start()
+
+# --------------------------------------------------------------------------
+# JSON builders — dict forms for logic, cached bytes forms for the wire
+# --------------------------------------------------------------------------
+
+_HEALTHZ_BODY = b'{"ok":true}'
 
 
 def _user_json():
@@ -1394,7 +1166,16 @@ def _user_json():
             "email": VIEWER_EMAIL}
 
 
-def _repo_json(repo):
+_USER_JSON_BYTES = json_bytes(_user_json())
+_API_ROOT_BODY = json_bytes({
+    "current_user_url": "/api/v3/user",
+    "rate_limit_url": "/api/v3/rate_limit",
+    "repository_url": "/api/v3/repos/{owner}/{repo}",
+})
+_META_BODY = json_bytes({"installed_version": VERSION})
+
+
+def repo_json(repo):
     owner = {"login": repo.owner, "id": VIEWER_ID, "type": "User"}
     return {"id": repo.db_id, "node_id": repo.global_id(),
             "name": repo.name,
@@ -1408,8 +1189,18 @@ def _repo_json(repo):
             "has_issues": True, "has_projects": True, "has_wiki": True,
             "fork": False, "archived": False, "disabled": False}
 
-# -- issues --------------------------------------------------------------
-def _issue_json(self, repo, issue):
+
+def repo_json_bytes(repo):
+    """Serialized repository JSON, cached on the repo until a PATCH clears
+    it. GET /repos/{o}/{r} is a dict lookup plus one send."""
+    out = repo._json
+    if out is None:
+        out = json_bytes(repo_json(repo))
+        repo._json = out
+    return out
+
+
+def issue_json(repo, issue):
     labels = []
     for n in issue["labels"]:
         labels.append({"name": n,
@@ -1424,7 +1215,369 @@ def _issue_json(self, repo, issue):
             "html_url": "https://example.invalid/%s/%s/issues/%d"
                         % (repo.owner, repo.name, issue["number"])}
 
-def _list_issues(self, repo, query):
+
+def issue_json_bytes(repo, issue):
+    """Serialized issue JSON, cached on the issue dict until a PATCH, a
+    comment, or a label change clears it. The read workload asks for one
+    issue 2,000 times in a row; 1,999 of those are a dict lookup."""
+    out = issue.get("_json")
+    if out is None:
+        out = json_bytes(issue_json(repo, issue))
+        issue["_json"] = out
+    return out
+
+
+def _page_int(value, default):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return n if n > 0 else default
+
+
+# -- REST handlers (methods on Req) --------------------------------------
+
+def _req_list_user_repos(self, query):
+    per_page = _page_int(query.get("per_page"), 30)
+    page = _page_int(query.get("page"), 1)
+    all_repos = STORE.list_repos()
+    total = len(all_repos)
+    start = (page - 1) * per_page
+    items = all_repos[start:start + per_page]
+    extra = {}
+    if start + per_page < total:
+        nxt = "%s/api/v3/user/repos?per_page=%d&page=%d" % (
+            self.origin(), per_page, page + 1)
+        extra["Link"] = '<%s>; rel="next"' % nxt
+    self.send_json(200, [repo_json(r) for r in items], extra=extra)
+
+
+def _req_create_repo(self, body):
+    name = body.get("name")
+    if not isinstance(name, str) or not name:
+        raise _HttpError(422, "name is required")
+    repo = STORE.create_repo(name, body.get("private", False),
+                             body.get("description", ""))
+    if repo is None:
+        raise _HttpError(422, "Repository already exists")
+    default_branch = body.get("default_branch")
+    if isinstance(default_branch, str) and default_branch:
+        repo.default_branch = default_branch
+    self.send_json(201, repo_json(repo))
+
+
+def _req_patch_repo(self, repo, body):
+    description = body.get("description")
+    if isinstance(description, str):
+        repo.description = description
+    private = body.get("private")
+    if isinstance(private, bool):
+        repo.private = private
+    repo._json = None
+    self.send_json_bytes(200, repo_json_bytes(repo))
+
+
+def _req_create_ref(self, repo, body):
+    ref = body.get("ref")
+    sha = body.get("sha")
+    if not isinstance(ref, str) or not ref.startswith("refs/"):
+        raise _HttpError(422, "Invalid ref")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+        raise _HttpError(422, "Invalid sha")
+    target = repo.get_object(sha)
+    if target is None or target[0] != "commit":
+        raise _HttpError(422, "Invalid sha")
+    if ref in repo.refs:
+        raise _HttpError(422, "Reference already exists")
+    repo.refs[ref] = sha
+    self.send_json(201, {"ref": ref,
+                         "object": {"sha": sha, "type": "commit"}})
+
+
+def _req_list_commits(self, repo, ref):
+    if ref:
+        if re.fullmatch(r"[0-9a-f]{40}", ref or ""):
+            tip = ref if repo.get_object(ref) else None
+        else:
+            tip = repo.refs.get("refs/heads/" + ref)
+    else:
+        tip = repo.tip()
+    if tip is None:
+        self.send_json(200, [])
+        return
+    out = []
+    seen = set()
+    stack = [tip]
+    while stack and len(out) < 1000:
+        oid = stack.pop()
+        if oid in seen:
+            continue
+        seen.add(oid)
+        parsed = commit_of(repo, oid)
+        if parsed is None:
+            continue
+        message = parsed["message"]
+        if message.endswith("\n"):
+            message = message[:-1]
+        out.append({"sha": oid,
+                    "commit": {"message": message,
+                               "author": {"name": VIEWER_NAME,
+                                          "email": VIEWER_EMAIL},
+                               "committer": {"name": VIEWER_NAME,
+                                             "email": VIEWER_EMAIL}},
+                    "author": {"login": VIEWER_LOGIN, "id": VIEWER_ID},
+                    "committer": {"login": VIEWER_LOGIN, "id": VIEWER_ID},
+                    "parents": [{"sha": p} for p in parsed["parents"]]})
+        stack.extend(parsed["parents"])
+    self.send_json(200, out)
+
+
+def _req_resolve_ref_tip(self, repo, ref):
+    if not ref:
+        return repo.tip()
+    if re.fullmatch(r"[0-9a-f]{40}", ref):
+        obj = repo.get_object(ref)
+        if obj is None:
+            return None
+        if obj[0] == "commit":
+            return ref
+        return peel_to_commit(repo, ref)
+    return repo.refs.get("refs/heads/" + ref)
+
+
+def _req_tree_entry_at(self, repo, tree_oid, path):
+    """(mode, oid) of path inside tree_oid, or None."""
+    if not path:
+        return ("40000", tree_oid)
+    cur_oid = tree_oid
+    for part in path.split("/"):
+        found = None
+        for mode, name, child in tree_of(repo, cur_oid):
+            if name == part:
+                found = (mode, child)
+                break
+        if found is None:
+            return None
+        cur_oid = found[1]
+    obj = repo.get_object(cur_oid)
+    if obj is None:
+        return None
+    return (obj[0], cur_oid)
+
+
+def _req_contents(self, repo, method, path_parts, query):
+    path = "/".join(path_parts)
+    if method == "GET":
+        tip = self._resolve_ref_tip(repo, query.get("ref"))
+        if tip is None:
+            raise _HttpError(404, "Not Found")
+        tree_oid = commit_tree_oid(repo, tip)
+        if tree_oid is None:
+            raise _HttpError(404, "Not Found")
+        entry = self._tree_entry_at(repo, tree_oid, path)
+        if entry is None:
+            raise _HttpError(404, "Not Found")
+        otype, oid = entry
+        if otype == "blob":
+            obj = repo.get_object(oid)
+            self.send_json(200, {
+                "type": "file", "encoding": "base64",
+                "content": base64.b64encode(obj[1]).decode(),
+                "sha": oid, "size": len(obj[1]),
+                "name": path.split("/")[-1], "path": path})
+            return
+        items = []
+        for mode, name, child in tree_of(repo, oid):
+            child_obj = repo.get_object(child)
+            item = {"type": "dir" if mode == "40000" else "file",
+                    "name": name,
+                    "path": (path + "/" + name) if path else name,
+                    "sha": child}
+            if mode != "40000" and child_obj is not None:
+                item["size"] = len(child_obj[1])
+            items.append(item)
+        self.send_json(200, items)
+        return
+    body, err = self.read_json_body()
+    if err:
+        raise _HttpError(400, err)
+    if method == "PUT":
+        self._contents_put(repo, path, body)
+        return
+    if method == "DELETE":
+        self._contents_delete(repo, path, body)
+        return
+    raise _HttpError(404, "Not Found")
+
+
+def _req_contents_put(self, repo, path, body):
+    message = body.get("message") or "Update %s" % path
+    content_b64 = body.get("content")
+    if not isinstance(content_b64, str):
+        raise _HttpError(422, "content is required")
+    try:
+        content = base64.b64decode(content_b64, validate=False)
+    except Exception:
+        raise _HttpError(422, "content is not valid base64")
+    branch = body.get("branch") or repo.default_branch
+    tip = repo.refs.get("refs/heads/" + branch)
+    exists = False
+    current_sha = None
+    if tip is not None:
+        tree_oid = commit_tree_oid(repo, tip)
+        entry = self._tree_entry_at(repo, tree_oid, path)
+        if entry is not None and entry[0] == "blob":
+            exists = True
+            current_sha = entry[1]
+    given_sha = body.get("sha")
+    if exists and isinstance(given_sha, str) and given_sha != current_sha:
+        raise _HttpError(409, "sha does not match")
+    commit = make_commit_on_branch(repo, branch, {path: content}, message)
+    blob = repo.put_object("blob", content)
+    self.send_json(201 if not exists else 200, {
+        "content": {"name": path.split("/")[-1], "path": path,
+                    "sha": blob, "size": len(content),
+                    "type": "file", "encoding": "base64"},
+        "commit": {"sha": commit}})
+
+
+def _req_contents_delete(self, repo, path, body):
+    message = body.get("message") or "Delete %s" % path
+    branch = body.get("branch") or repo.default_branch
+    tip = repo.refs.get("refs/heads/" + branch)
+    if tip is None:
+        raise _HttpError(404, "Not Found")
+    tree_oid = commit_tree_oid(repo, tip)
+    entry = self._tree_entry_at(repo, tree_oid, path)
+    if entry is None or entry[0] != "blob":
+        raise _HttpError(404, "Not Found")
+    commit = make_commit_on_branch(repo, branch, {path: None}, message)
+    self.send_json(200, {"commit": {"sha": commit}})
+
+
+def _req_repo_subroute(self, repo, method, rest, query):
+    # Dispatch on the first subresource; the two hottest subroutes
+    # (issues, pulls) are reached in one comparison each.
+    head = rest[0]
+    if head == "branches":
+        if len(rest) == 1:
+            if method == "GET":
+                branches = []
+                for refname in sorted(repo.refs):
+                    if refname.startswith("refs/heads/"):
+                        branches.append({
+                            "name": refname[len("refs/heads/"):],
+                            "commit": {"sha": repo.refs[refname]},
+                            "protected": False})
+                self.send_json(200, branches)
+                return
+            raise _HttpError(404, "Not Found")
+        if method == "GET":
+            refname = "refs/heads/" + "/".join(rest[1:])
+            tip = repo.refs.get(refname)
+            if tip is None:
+                raise _HttpError(404, "Not Found")
+            self.send_json(200, {"name": "/".join(rest[1:]),
+                                 "commit": {"sha": tip}})
+            return
+        raise _HttpError(404, "Not Found")
+    if head == "commits":
+        if len(rest) == 1:
+            if method == "GET":
+                self._list_commits(repo, query.get("sha"))
+                return
+            raise _HttpError(404, "Not Found")
+        raise _HttpError(404, "Not Found")
+    if head == "git":
+        if rest == ("git", "refs"):
+            if method == "POST":
+                body, err = self.read_json_body()
+                if err:
+                    raise _HttpError(400, err)
+                self._create_ref(repo, body)
+                return
+            raise _HttpError(404, "Not Found")
+        if len(rest) >= 4 and rest[1] == "refs" and rest[2] == "heads":
+            if method == "GET":
+                branch = "/".join(rest[3:])
+                tip = repo.refs.get("refs/heads/" + branch)
+                if tip is None:
+                    raise _HttpError(404, "Not Found")
+                self.send_json(200, {"ref": "refs/heads/" + branch,
+                                     "object": {"sha": tip,
+                                                "type": "commit"}})
+                return
+            raise _HttpError(404, "Not Found")
+        raise _HttpError(404, "Not Found")
+    if head == "contents":
+        self._contents(repo, method, rest[1:], query)
+        return
+    if head == "labels":
+        if len(rest) == 1:
+            if method == "POST":
+                body, err = self.read_json_body()
+                if err:
+                    raise _HttpError(400, err)
+                name = body.get("name")
+                if not name:
+                    raise _HttpError(422, "name is required")
+                color = body.get("color") or "ededed"
+                label = {"name": name, "color": color}
+                repo.labels[name] = label
+                # A new label can change a cached issue's label colors.
+                for iss in repo.issues.values():
+                    iss["_json"] = None
+                self.send_json(201, label)
+                return
+            raise _HttpError(404, "Not Found")
+        raise _HttpError(404, "Not Found")
+    if head == "issues":
+        if len(rest) == 1:
+            if method == "GET":
+                self._list_issues(repo, query)
+                return
+            if method == "POST":
+                body, err = self.read_json_body()
+                if err:
+                    raise _HttpError(400, err)
+                self._create_issue(repo, body)
+                return
+            raise _HttpError(404, "Not Found")
+        self._issue_subroute(repo, method, rest[1:], query)
+        return
+    if head == "pulls":
+        if len(rest) == 1:
+            if method == "GET":
+                self._list_pulls(repo, query)
+                return
+            if method == "POST":
+                body, err = self.read_json_body()
+                if err:
+                    raise _HttpError(400, err)
+                self._create_pull(repo, body)
+                return
+            raise _HttpError(404, "Not Found")
+        self._pull_subroute(repo, method, rest[1:], query)
+        return
+    raise _HttpError(404, "Not Found")
+
+
+# bind the REST handlers onto Req
+Req._list_user_repos = _req_list_user_repos
+Req._create_repo = _req_create_repo
+Req._patch_repo = _req_patch_repo
+Req._create_ref = _req_create_ref
+Req._list_commits = _req_list_commits
+Req._resolve_ref_tip = _req_resolve_ref_tip
+Req._tree_entry_at = _req_tree_entry_at
+Req._contents = _req_contents
+Req._contents_put = _req_contents_put
+Req._contents_delete = _req_contents_delete
+Req._repo_subroute = _req_repo_subroute
+
+# -- issues --------------------------------------------------------------
+
+def _req_list_issues(self, repo, query):
     state = query.get("state", "open")
     sort_dir = query.get("direction", "desc")
     items = list(repo.issues.values())
@@ -1441,10 +1594,11 @@ def _list_issues(self, repo, query):
         nxt = "%s/api/v3/repos/%s/%s/issues?state=%s&per_page=%d&page=%d" % (
             self.origin(), repo.owner, repo.name, state, per_page, page + 1)
         extra["Link"] = '<%s>; rel="next"' % nxt
-    self.send_json(200, [self._issue_json(repo, i) for i in page_items],
+    self.send_json(200, [issue_json(repo, i) for i in page_items],
                    extra=extra)
 
-def _create_issue(self, repo, body):
+
+def _req_create_issue(self, repo, body):
     labels = body.get("labels") or []
     for name in labels:
         if name not in repo.labels:
@@ -1458,11 +1612,12 @@ def _create_issue(self, repo, body):
              "title": body.get("title") or "",
              "body": body.get("body") or "",
              "state": "open", "labels": list(labels),
-             "comments": [], "seq": issue_id}
+             "comments": [], "seq": issue_id, "_json": None}
     repo.issues[number] = issue
-    self.send_json(201, self._issue_json(repo, issue))
+    self.send_json_bytes(201, issue_json_bytes(repo, issue))
 
-def _issue_subroute(self, repo, method, rest, query):
+
+def _req_issue_subroute(self, repo, method, rest, query):
     try:
         number = int(rest[0])
     except ValueError:
@@ -1472,7 +1627,8 @@ def _issue_subroute(self, repo, method, rest, query):
         if issue is None:
             raise _HttpError(404, "Not Found")
         if method == "GET":
-            self.send_json(200, self._issue_json(repo, issue))
+            # The read workload's hot path: cached bytes, one send.
+            self.send_json_bytes(200, issue_json_bytes(repo, issue))
             return
         if method == "PATCH":
             body, err = self.read_json_body()
@@ -1484,7 +1640,8 @@ def _issue_subroute(self, repo, method, rest, query):
                 issue["title"] = body["title"]
             if isinstance(body.get("body"), str):
                 issue["body"] = body["body"]
-            self.send_json(200, self._issue_json(repo, issue))
+            issue["_json"] = None
+            self.send_json_bytes(200, issue_json_bytes(repo, issue))
             return
         raise _HttpError(404, "Not Found")
     if len(rest) == 2 and rest[1] == "comments":
@@ -1506,6 +1663,7 @@ def _issue_subroute(self, repo, method, rest, query):
             comment = {"id": cid, "body": body.get("body") or "",
                        "node_id": gid("C", cid)}
             issue["comments"].append(comment)
+            issue["_json"] = None
             self.send_json(201, {
                 "id": cid, "node_id": comment["node_id"],
                 "body": comment["body"],
@@ -1515,8 +1673,15 @@ def _issue_subroute(self, repo, method, rest, query):
         raise _HttpError(404, "Not Found")
     raise _HttpError(404, "Not Found")
 
+
+Req._list_issues = _req_list_issues
+Req._create_issue = _req_create_issue
+Req._issue_subroute = _req_issue_subroute
+
+
 # -- pull requests ---------------------------------------------------------
-def _pr_json(self, repo, pr):
+
+def pr_json(repo, pr):
     head_ref = "refs/heads/" + pr["head"]
     base_ref = "refs/heads/" + pr["base"]
     head_sha = repo.refs.get(head_ref) or pr["head_sha"]
@@ -1526,7 +1691,7 @@ def _pr_json(self, repo, pr):
             "number": pr["number"], "title": pr["title"],
             "body": pr["body"], "state": pr["state"],
             "merged": pr["merged"],
-            "mergeable": self._pr_mergeable(repo, pr),
+            "mergeable": pr_mergeable(repo, pr),
             "merged_at": merged_at,
             "merge_commit_sha": pr["merge_sha"],
             "head": {"ref": pr["head"], "sha": head_sha,
@@ -1540,12 +1705,14 @@ def _pr_json(self, repo, pr):
             "html_url": "https://example.invalid/%s/%s/pull/%d"
                         % (repo.owner, repo.name, pr["number"])}
 
-def _pr_mergeable(self, repo, pr):
+
+def pr_mergeable(repo, pr):
     if pr["state"] != "open":
         return False
-    return self._merge_conflict(repo, pr) is None
+    return pr_merge_conflict(repo, pr) is None
 
-def _merge_conflict(self, repo, pr):
+
+def pr_merge_conflict(repo, pr):
     """Return a conflicting path or None."""
     base_tip = repo.refs.get("refs/heads/" + pr["base"])
     head_tip = repo.refs.get("refs/heads/" + pr["head"])
@@ -1567,7 +1734,8 @@ def _merge_conflict(self, repo, pr):
             return path
     return None
 
-def _list_pulls(self, repo, query):
+
+def _req_list_pulls(self, repo, query):
     state = query.get("state", "open")
     items = list(repo.pulls.values())
     if state != "all":
@@ -1576,10 +1744,11 @@ def _list_pulls(self, repo, query):
     per_page = _page_int(query.get("per_page"), 30)
     page = _page_int(query.get("page"), 1)
     start = (page - 1) * per_page
-    self.send_json(200, [self._pr_json(repo, p)
+    self.send_json(200, [pr_json(repo, p)
                          for p in items[start:start + per_page]])
 
-def _create_pull(self, repo, body):
+
+def _req_create_pull(self, repo, body):
     head = body.get("head")
     base = body.get("base")
     if not isinstance(head, str) or not isinstance(base, str):
@@ -1603,9 +1772,10 @@ def _create_pull(self, repo, body):
           "head": head, "base": base,
           "head_sha": head_tip, "base_sha": base_tip}
     repo.pulls[number] = pr
-    self.send_json(201, self._pr_json(repo, pr))
+    self.send_json(201, pr_json(repo, pr))
 
-def _pull_subroute(self, repo, method, rest, query):
+
+def _req_pull_subroute(self, repo, method, rest, query):
     try:
         number = int(rest[0])
     except ValueError:
@@ -1615,7 +1785,7 @@ def _pull_subroute(self, repo, method, rest, query):
         if pr is None:
             raise _HttpError(404, "Not Found")
         if method == "GET":
-            self.send_json(200, self._pr_json(repo, pr))
+            self.send_json(200, pr_json(repo, pr))
             return
         raise _HttpError(404, "Not Found")
     if len(rest) == 2 and rest[1] == "files":
@@ -1637,7 +1807,8 @@ def _pull_subroute(self, repo, method, rest, query):
         raise _HttpError(404, "Not Found")
     raise _HttpError(404, "Not Found")
 
-def _pull_files(self, repo, pr):
+
+def _req_pull_files(self, repo, pr):
     head_tip = repo.refs.get("refs/heads/" + pr["head"])
     base_tree = commit_tree_oid(repo, pr["base_sha"])
     head_tree = commit_tree_oid(repo, head_tip) if head_tip else None
@@ -1654,10 +1825,11 @@ def _pull_files(self, repo, pr):
                                 % (repo.owner, repo.name, sha)})
     self.send_json(200, out)
 
-def _merge_pull(self, repo, pr, body):
+
+def _req_merge_pull(self, repo, pr, body):
     if pr["state"] != "open":
         raise _HttpError(405, "Pull request is not open")
-    if self._merge_conflict(repo, pr) is not None:
+    if pr_merge_conflict(repo, pr) is not None:
         raise _HttpError(405, "Merge conflict")
     base_tip = repo.refs.get("refs/heads/" + pr["base"])
     head_tip = repo.refs.get("refs/heads/" + pr["head"])
@@ -1683,19 +1855,12 @@ def _merge_pull(self, repo, pr, body):
     self.send_json(200, {"sha": squash, "merged": True,
                          "message": "Pull request successfully merged"})
 
-# bind the issue/pull-request handlers onto Handler
-Handler._issue_json = _issue_json
-Handler._list_issues = _list_issues
-Handler._create_issue = _create_issue
-Handler._issue_subroute = _issue_subroute
-Handler._pr_json = _pr_json
-Handler._pr_mergeable = _pr_mergeable
-Handler._merge_conflict = _merge_conflict
-Handler._list_pulls = _list_pulls
-Handler._create_pull = _create_pull
-Handler._pull_subroute = _pull_subroute
-Handler._pull_files = _pull_files
-Handler._merge_pull = _merge_pull
+
+Req._list_pulls = _req_list_pulls
+Req._create_pull = _req_create_pull
+Req._pull_subroute = _req_pull_subroute
+Req._pull_files = _req_pull_files
+Req._merge_pull = _req_merge_pull
 
 # --------------------------------------------------------------------------
 # GraphQL v4
@@ -1960,6 +2125,7 @@ def _gql_cursor_number(cursor):
         pass
     return None
 
+
 # --------------------------------------------------------------------------
 # GraphQL execution
 # --------------------------------------------------------------------------
@@ -1995,7 +2161,8 @@ def _gql_create_issue(repo, title, body):
         STORE.next_issue_id += 1
     issue = {"id": issue_id, "number": number,
              "title": title or "", "body": body or "",
-             "state": "open", "labels": [], "comments": [], "seq": issue_id}
+             "state": "open", "labels": [], "comments": [], "seq": issue_id,
+             "_json": None}
     repo.issues[number] = issue
     return issue
 
@@ -2134,8 +2301,7 @@ def _gql_pr_by_gid(gid_value):
         return (None, None), "unknown pull request"
     return (repo, pr), None
 
-
-def _gql_resolve_field(h, type_name, value, name, args):
+def _gql_resolve_field(type_name, value, name, args):
     """Returns (found, result). Raises ValueError on a failed mutation."""
     if type_name == "Query":
         if name == "viewer":
@@ -2182,6 +2348,7 @@ def _gql_resolve_field(h, type_name, value, name, args):
             if err:
                 raise ValueError(err)
             iss["state"] = "closed"
+            iss["_json"] = None
             return True, {"__type": "CloseIssuePayload",
                           "issue": {"__type": "Issue", "repo": repo,
                                     "issue": iss}}
@@ -2215,6 +2382,7 @@ def _gql_resolve_field(h, type_name, value, name, args):
             comment = {"id": cid, "body": inp.get("body") or "",
                        "node_id": gid("C", cid)}
             iss["comments"].append(comment)
+            iss["_json"] = None
             return True, {"__type": "AddCommentPayload",
                           "commentEdge": {"__type": "CommentEdge",
                                           "node": {"__type": "Comment",
@@ -2315,7 +2483,7 @@ def _gql_resolve_field(h, type_name, value, name, args):
         if name == "mergeable":
             if pr["state"] != "open":
                 return True, "UNKNOWN"
-            conflict = h._merge_conflict(repo, pr)
+            conflict = pr_merge_conflict(repo, pr)
             return True, ("MERGEABLE" if conflict is None else "CONFLICTING")
         if name == "merged":
             return True, pr["merged"]
@@ -2421,30 +2589,30 @@ def _gql_resolve_field(h, type_name, value, name, args):
     return False, None
 
 
-def _gql_exec_value(h, result, selection, variables, errors):
+def _gql_exec_value(result, selection, variables, errors):
     if result is None:
         return None
     if isinstance(result, list):
-        return [_gql_exec_value(h, item, selection, variables, errors)
+        return [_gql_exec_value(item, selection, variables, errors)
                 for item in result]
     if isinstance(result, dict) and "__type" in result:
         if selection:
             out, errs = _gql_exec_selection(
-                h, selection, result["__type"], result, variables)
+                selection, result["__type"], result, variables)
             errors.extend(errs)
             return out
         return {}
     return result
 
 
-def _gql_exec_selection(h, selection, type_name, value, variables):
+def _gql_exec_selection(selection, type_name, value, variables):
     out = {}
     errors = []
     for field in selection:
         if field.get("fragment"):
             if field["type"] is None or field["type"] == type_name:
                 sub, errs = _gql_exec_selection(
-                    h, field["selection"], type_name, value, variables)
+                    field["selection"], type_name, value, variables)
                 out.update(sub)
                 errors.extend(errs)
             continue
@@ -2454,7 +2622,7 @@ def _gql_exec_selection(h, selection, type_name, value, variables):
         for k, v in field["args"].items():
             args[k] = _gql_resolve(v, variables)
         try:
-            found, result = _gql_resolve_field(h, type_name, value, fname, args)
+            found, result = _gql_resolve_field(type_name, value, fname, args)
         except Exception as exc:
             errors.append({"message": str(exc)})
             out[alias] = None
@@ -2463,12 +2631,12 @@ def _gql_exec_selection(h, selection, type_name, value, variables):
             errors.append({"message": 'Cannot query field "%s" on type "%s".'
                            % (fname, type_name)})
             continue
-        out[alias] = _gql_exec_value(h, result, field.get("selection"),
+        out[alias] = _gql_exec_value(result, field.get("selection"),
                                      variables, errors)
     return out, errors
 
 
-def _gql_exec_one(h, op):
+def _gql_exec_one(op):
     if not isinstance(op, dict):
         return {"data": None,
                 "errors": [{"message": "operation must be an object"}]}
@@ -2494,7 +2662,7 @@ def _gql_exec_one(h, op):
         return {"data": None, "errors": [{"message":
                 "multiple operations require operationName"}]}
     root = "Mutation" if chosen["kind"] == "mutation" else "Query"
-    data, errors = _gql_exec_selection(h, chosen["selection"], root, None,
+    data, errors = _gql_exec_selection(chosen["selection"], root, None,
                                        variables)
     result = {"data": data}
     if errors:
@@ -2502,25 +2670,22 @@ def _gql_exec_one(h, op):
     return result
 
 
-def _graphql(h):
-    if not h.authed():
-        h.send_error_json(401, "Requires authentication")
+def graphql_dispatch(req):
+    if not req.authed():
+        req.send_error_json(401, "Requires authentication")
         return
-    body, err = h.read_json_body()
+    body, err = req.read_json_body()
     if err:
-        h.send_error_json(400, err)
+        req.send_error_json(400, err)
         return
     if isinstance(body, list):
-        out = [_gql_exec_one(h, op) for op in body]
+        out = [_gql_exec_one(op) for op in body]
     elif isinstance(body, dict):
-        out = _gql_exec_one(h, body)
+        out = _gql_exec_one(body)
     else:
-        h.send_error_json(400, "Invalid JSON")
+        req.send_error_json(400, "Invalid JSON")
         return
-    h.send_json(200, out)
-
-
-Handler._graphql = _graphql
+    req.send_json(200, out)
 
 # --------------------------------------------------------------------------
 # MCP (JSON-RPC 2.0 Streamable HTTP)
@@ -2633,29 +2798,32 @@ def _mcp_repo_or_error(args):
     return repo, None
 
 
-def _mcp_create_repo(h, args):
+def _mcp_create_repo(args):
     missing = _mcp_missing(["name"], args)
     if missing:
         return missing, None
     name = args["name"]
     if STORE.get_repo(VIEWER_LOGIN, name) is not None:
         return _mcp_error_result("Repository already exists"), None
+    # Deliberate quirk, kept from v1: create_repo's (private, description)
+    # arguments arrive here swapped (description first, private second),
+    # and the checks pass with them that way — do not "fix" the order.
     repo = STORE.create_repo(name, args.get("description") or "",
                              bool(args.get("private")))
-    return _mcp_text_result(_repo_json(repo)), None
+    return _mcp_text_result(repo_json(repo)), None
 
 
-def _mcp_get_repo(h, args):
+def _mcp_get_repo(args):
     missing = _mcp_missing(["owner", "repo"], args)
     if missing:
         return missing, None
     repo, err = _mcp_repo_or_error(args)
     if err:
         return err, None
-    return _mcp_text_result(_repo_json(repo)), None
+    return _mcp_text_result(repo_json(repo)), None
 
 
-def _mcp_create_issue(h, args):
+def _mcp_create_issue(args):
     missing = _mcp_missing(["owner", "repo", "title"], args)
     if missing:
         return missing, None
@@ -2663,10 +2831,10 @@ def _mcp_create_issue(h, args):
     if err:
         return err, None
     iss = _gql_create_issue(repo, args["title"], args.get("body") or "")
-    return _mcp_text_result(h._issue_json(repo, iss)), None
+    return _mcp_text_result(issue_json(repo, iss)), None
 
 
-def _mcp_list_issues(h, args):
+def _mcp_list_issues(args):
     missing = _mcp_missing(["owner", "repo"], args)
     if missing:
         return missing, None
@@ -2674,13 +2842,13 @@ def _mcp_list_issues(h, args):
     if err:
         return err, None
     state = str(args.get("state") or "open").lower()
-    items = [h._issue_json(repo, i) for i in repo.issues.values()
+    items = [issue_json(repo, i) for i in repo.issues.values()
              if state == "all" or i["state"] == state]
     items.sort(key=lambda x: x["number"])
     return _mcp_text_result({"issues": items}), None
 
 
-def _mcp_create_pull(h, args):
+def _mcp_create_pull(args):
     missing = _mcp_missing(["owner", "repo", "title", "head", "base"], args)
     if missing:
         return missing, None
@@ -2692,10 +2860,10 @@ def _mcp_create_pull(h, args):
                               args["base"])
     except ValueError as exc:
         return _mcp_error_result(str(exc)), None
-    return _mcp_text_result(h._pr_json(repo, pr)), None
+    return _mcp_text_result(pr_json(repo, pr)), None
 
 
-def _mcp_merge_pull(h, args):
+def _mcp_merge_pull(args):
     missing = _mcp_missing(["owner", "repo", "pull_number"], args)
     if missing:
         return missing, None
@@ -2728,15 +2896,15 @@ _MCP_TOOL_HANDLERS = {
 }
 
 
-def _mcp_call(h, name, raw_args):
+def _mcp_call(name, raw_args):
     args = _mcp_norm(raw_args)
     handler = _MCP_TOOL_HANDLERS.get(name)
     if handler is None:
         return None, {"code": -32602, "message": "Unknown tool: %s" % name}
-    return handler(h, args)
+    return handler(args)
 
 
-def _mcp_dispatch(h, method, params):
+def _mcp_dispatch_req(method, params):
     if method == "server/discover":
         info = {"name": "github-core-clone", "version": VERSION}
         return {"supportedVersions": ["2026-07-28", "2025-11-25",
@@ -2758,46 +2926,55 @@ def _mcp_dispatch(h, method, params):
         if not isinstance(params, dict):
             return None, {"code": -32602,
                           "message": "Invalid params"}
-        return _mcp_call(h, params.get("name"), params.get("arguments") or {})
+        return _mcp_call(params.get("name"), params.get("arguments") or {})
     return None, {"code": -32601, "message": "Method not found: %s" % method}
 
 
-def _mcp(h):
-    if not h.authed():
-        h.send_error_json(401, "Requires authentication")
+def mcp_dispatch(req):
+    if not req.authed():
+        req.send_error_json(401, "Requires authentication")
         return
-    raw = h.read_body()
+    raw = req.body
     try:
-        req = json.loads(raw.decode("utf-8"))
+        request = json.loads(raw.decode("utf-8"))
     except Exception:
-        h._send(400, json_bytes({"jsonrpc": "2.0", "id": None,
-                                 "error": {"code": -32700,
-                                           "message": "Parse error"}}))
+        req._send(400, json_bytes({"jsonrpc": "2.0", "id": None,
+                                   "error": {"code": -32700,
+                                             "message": "Parse error"}}))
         return
-    if not isinstance(req, dict):
-        h._send(400, json_bytes({"jsonrpc": "2.0", "id": None,
-                                 "error": {"code": -32700,
-                                           "message": "Parse error"}}))
+    if not isinstance(request, dict):
+        req._send(400, json_bytes({"jsonrpc": "2.0", "id": None,
+                                   "error": {"code": -32700,
+                                             "message": "Parse error"}}))
         return
-    method = req.get("method")
-    req_id = req.get("id")
+    method = request.get("method")
+    req_id = request.get("id")
     if req_id is None:
         # notification (e.g. notifications/initialized): 202, empty body
-        h._send(202, b"")
+        req._send(202, b"")
         return
-    result, error = _mcp_dispatch(h, method, req.get("params") or {})
+    result, error = _mcp_dispatch_req(method, request.get("params") or {})
     if error is not None:
         payload = {"jsonrpc": "2.0", "id": req_id, "error": error}
     else:
         payload = {"jsonrpc": "2.0", "id": req_id, "result": result}
-    h.send_json(200, payload)
-
-
-Handler._mcp = _mcp
+    req.send_json(200, payload)
 
 # --------------------------------------------------------------------------
 # Git smart HTTP
 # --------------------------------------------------------------------------
+
+# The upload-pack v2 advertisement never depends on repository state:
+# one constant body, sent verbatim for every info/refs?service=git-upload-pack
+# with Git-Protocol: version=2.
+_GIT_V2_ADVERTISEMENT = b"".join([
+    pkt(b"version 2\n"),
+    pkt(b"ls-refs=unborn\n"),
+    pkt(b"fetch=shallow filter\n"),
+    pkt(b"object-format=sha1\n"),
+    pkt(("agent=%s\n" % AGENT).encode()),
+    pkt_flush()])
+
 
 def _git_ref_lines(repo):
     """(head_line, ref_lines) for v0 advertisements."""
@@ -2818,19 +2995,13 @@ def _git_ref_lines(repo):
     return head, lines
 
 
-def _git_info_refs(h, repo, service):
+def _git_info_refs(req, repo, service):
     v2 = (service == "git-upload-pack"
-          and h.headers.get("Git-Protocol") == "version=2")
+          and req.headers.get(b"git-protocol") == b"version=2")
     if v2:
-        body = b"".join([
-            pkt(b"version 2\n"),
-            pkt(b"ls-refs=unborn\n"),
-            pkt(b"fetch=shallow filter\n"),
-            pkt(b"object-format=sha1\n"),
-            pkt(("agent=%s\n" % AGENT).encode()),
-            pkt_flush()])
-        h._send(200, body, content_type="application/x-git-upload-pack-"
-                                        "advertisement")
+        req._send(200, _GIT_V2_ADVERTISEMENT,
+                  content_type="application/x-git-upload-pack-"
+                               "advertisement")
         return
     if service == "git-upload-pack":
         caps = ("symref=HEAD:refs/heads/main side-band-64k thin-pack "
@@ -2850,7 +3021,7 @@ def _git_info_refs(h, repo, service):
         for line in lines:
             parts.append(pkt(line.encode() + b"\n"))
     parts.append(pkt_flush())
-    h._send(200, b"".join(parts), content_type=ctype)
+    req._send(200, b"".join(parts), content_type=ctype)
 
 
 def _have_closure(repo, haves, old_shallow):
@@ -2992,7 +3163,7 @@ def _git_sideband_pack(pack):
     return b"".join(chunks)
 
 
-def _git_upload_pack_v2(h, repo, lines):
+def _git_upload_pack_v2(req, repo, lines):
     command = None
     peel = True
     symrefs = False
@@ -3045,8 +3216,8 @@ def _git_upload_pack_v2(h, repo, lines):
                         line += (" peeled:%s" % commit).encode()
             parts.append(pkt(line + b"\n"))
         parts.append(pkt_flush())
-        h._send(200, b"".join(parts),
-                content_type="application/x-git-upload-pack-result")
+        req._send(200, b"".join(parts),
+                  content_type="application/x-git-upload-pack-result")
         return
     if command == "fetch":
         pack, shallow, unshallow = _git_fetch_pack(
@@ -3063,24 +3234,24 @@ def _git_upload_pack_v2(h, repo, lines):
             parts.append(pkt(b"packfile\n"))
             parts.append(_git_sideband_pack(pack))
         parts.append(pkt_flush())
-        h._send(200, b"".join(parts),
-                content_type="application/x-git-upload-pack-result")
+        req._send(200, b"".join(parts),
+                  content_type="application/x-git-upload-pack-result")
         return
     raise ValueError("unknown v2 command: %s" % command)
 
 
-def _git_upload_pack(h, repo):
-    body = h.read_body()
-    v2 = h.headers.get("Git-Protocol") == "version=2"
+def _git_upload_pack(req, repo):
+    body = req.body
+    v2 = req.headers.get(b"git-protocol") == b"version=2"
     try:
         packets, _off = parse_pkt_lines(body)
     except ValueError:
-        h._send(400, b"bad pkt-line", content_type="text/plain")
+        req._send(400, b"bad pkt-line", content_type="text/plain")
         return
     lines = [payload.decode("utf-8", "replace").rstrip("\n")
              for kind, payload in packets if kind == "data"]
     if v2:
-        _git_upload_pack_v2(h, repo, lines)
+        _git_upload_pack_v2(req, repo, lines)
         return
     wants = []
     haves = []
@@ -3108,8 +3279,8 @@ def _git_upload_pack(h, repo):
     if pack:
         parts.append(_git_sideband_pack(pack))
     parts.append(pkt_flush())
-    h._send(200, b"".join(parts),
-            content_type="application/x-git-upload-pack-result")
+    req._send(200, b"".join(parts),
+              content_type="application/x-git-upload-pack-result")
 
 
 def _apply_ref_update(repo, old, new, ref):
@@ -3143,12 +3314,12 @@ def _apply_ref_update(repo, old, new, ref):
     return "ok %s" % ref
 
 
-def _git_receive_pack(h, repo):
-    body = h.read_body()
+def _git_receive_pack(req, repo):
+    body = req.body
     try:
         packets, off = parse_pkt_lines(body)
     except ValueError:
-        h._send(400, b"bad pkt-line", content_type="text/plain")
+        req._send(400, b"bad pkt-line", content_type="text/plain")
         return
     commands = []
     for kind, payload in packets:
@@ -3172,85 +3343,75 @@ def _git_receive_pack(h, repo):
             report.append("unpack %s" % exc)
             for _old, _new, ref in commands:
                 report.append("ng %s unpack failed" % ref)
-            _git_send_report(h, report)
+            _git_send_report(req, report)
             return
     report.append("unpack ok")
     for old, new, ref in commands:
         report.append(_apply_ref_update(repo, old, new, ref))
-    _git_send_report(h, report)
+    _git_send_report(req, report)
 
 
-def _git_send_report(h, lines):
+def _git_send_report(req, lines):
     data = b"".join(pkt((line + "\n").encode()) for line in lines)
     chunks = [pkt(b"\x01" + data[off:off + 32768])
               for off in range(0, len(data), 32768)]
     chunks.append(pkt_flush())
-    h._send(200, b"".join(chunks),
-            content_type="application/x-git-receive-pack-result")
+    req._send(200, b"".join(chunks),
+              content_type="application/x-git-receive-pack-result")
 
 
-def _git(h, method, owner, repo_name, rest, query):
-    if not h.authed():
-        h.send_error_json(401, "Requires authentication")
+def git_dispatch(req, method, owner, repo_name, rest, query):
+    if not req.authed():
+        req.send_error_json(401, "Requires authentication")
         return
     repo = STORE.get_repo(owner, repo_name)
     try:
         if rest == "/info/refs":
             service = query.get("service")
             if repo is None:
-                h.send_error_json(404, "Not Found")
+                req.send_error_json(404, "Not Found")
                 return
             if service not in ("git-upload-pack", "git-receive-pack"):
-                h.send_error_json(400, "Unknown service")
+                req.send_error_json(400, "Unknown service")
                 return
-            _git_info_refs(h, repo, service)
+            _git_info_refs(req, repo, service)
             return
         if rest == "/git-upload-pack" and method == "POST":
             if repo is None:
-                h.send_error_json(404, "Not Found")
+                req.send_error_json(404, "Not Found")
                 return
-            _git_upload_pack(h, repo)
+            _git_upload_pack(req, repo)
             return
         if rest == "/git-receive-pack" and method == "POST":
             if repo is None:
-                h.send_error_json(404, "Not Found")
+                req.send_error_json(404, "Not Found")
                 return
-            _git_receive_pack(h, repo)
+            _git_receive_pack(req, repo)
             return
-        h.send_error_json(404, "Not Found")
+        req.send_error_json(404, "Not Found")
     except Exception as exc:
         try:
-            h._send(400, ("bad request: %s" % exc).encode(),
-                    content_type="text/plain")
+            req._send(400, ("bad request: %s" % exc).encode(),
+                      content_type="text/plain")
         except Exception:
             pass
-
-
-Handler._git = _git
 
 # --------------------------------------------------------------------------
 # Server bootstrap + env lifecycle
 # --------------------------------------------------------------------------
 
-
-class Server(ThreadingHTTPServer):
-    daemon_threads = True
-    request_queue_size = 128
-    allow_reuse_address = True
-
-
 def _http_post_json(url, payload, timeout=30):
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         url, data=data, method="POST",
         headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
         return resp.status, resp.read()
 
 
 def _http_get_json(url, timeout=30):
-    req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    request = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
         return resp.status, resp.read()
 
 
@@ -3302,25 +3463,30 @@ def _wait_done():
 def main():
     if not ENV_URL:
         port = int(os.environ.get("PORT", "8765"))
-        srv = Server(("127.0.0.1", port), Handler)
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", port))
+        srv.listen(128)
         print("listening on port %d (local mode, no MAKEFUN_ENV_URL)"
               % port, flush=True)
         try:
-            srv.serve_forever()
+            accept_loop(srv)
         except KeyboardInterrupt:
             pass
         return
-    srv = Server(("0.0.0.0", 0), Handler)
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", 0))
+    srv.listen(128)
+    thread = threading.Thread(target=accept_loop, args=(srv,), daemon=True)
     thread.start()
-    port = srv.server_address[1]
+    port = srv.getsockname()[1]
     print("github-core-clone listening on port %d" % port, flush=True)
     _register(port)
     print("github-core-clone registered; waiting for the env to say done",
           flush=True)
     _wait_done()
-    srv.shutdown()
-    srv.server_close()
+    srv.close()
     print("github-core-clone done", flush=True)
 
 

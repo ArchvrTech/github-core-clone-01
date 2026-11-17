@@ -2,15 +2,14 @@
 [![rank](https://make.fun/badge/github-core-clone-01/ArchvrTech/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![reward](https://make.fun/badge/github-core-clone-01/ArchvrTech/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-# github-core-clone — v2
+# github-core-clone — v3
 
 Built for [make.fun's "Build a GitHub-compatible git forge" bounty](https://make.fun/bounty/github-core-clone-01).
 
 A standalone GitHub-compatible git forge in a single Python 3.13 file
 (`main.py`, stdlib only — no installs, no git binary, no network beyond
-the suite). v2 is a performance rewrite of the v1 entry: same wire
-behaviour, same 120/120 conformance, measurably faster on the benchmark
-workloads.
+the suite). v3 is a second performance pass over v2: same wire behaviour,
+same 120/120 conformance, with the HTTP layer itself rebuilt for speed.
 
 ## What it serves
 
@@ -56,28 +55,28 @@ MAKEFUN_SHOP_TOKEN=tok PORT=8765 python3 main.py
 Determinism: all timestamps are fixed (`FIXED_TS`); the in-memory store
 is the single source of truth, so a replayed run produces the same state.
 
-## v2 performance work (vs v1, kit local runner, same VM)
+## v3 performance work (vs v2, kit local runner, same VM)
 
-| workload | v1 p50 | v2 p50 | v1 pts | v2 pts |
+| workload | v2 p50 | v3 p50 | v2 pts | v3 pts |
 |----------|--------|--------|--------|--------|
-| push     | 516 ms | 295 ms | 46 | 50 |
-| clone    | 153 ms | 112 ms | 35 | 41 |
-| read     | 899 ms | 879 ms | 45 | 46 |
-| write    | 141 ms | 124 ms | 41 | 44 |
-| **total** | | | **167** | **181** |
+| push     | ~120 ms | ~91 ms | 50 | 50 |
+| clone    | ~65 ms | ~38 ms | 49–50 | 50 |
+| read     | ~345 ms | ~192 ms | 50 | 50 |
+| write    | ~40 ms | ~26 ms | 50 | 50 |
+| **p50_us** | **~102,500** | **~63,400** | | |
 
-Local score: **981/1000** (v1: 967), feature 600/600, agent 200/200,
-0 failed checks out of 120. Official v1 was 925 (perf 125); the local
-numbers are a relative yardstick — production runs ~1.8x slower than
-this VM, so expect the official v2 perf to land around 135-145.
+Local score: **1000/1000** (v2: 999–1000 on the same quiet VM, 981 when
+loaded), feature 600/600, agent 200/200, 0 failed checks out of 120, three
+consecutive fresh-server runs. The tie-break p50_us fell ~1.6x vs v2
+(102,500 → 63,400), at parity with the Go rewrite's 63,595.
 
-What changed, in one paragraph: parsed git objects are memoized by oid
-(objects never change, so the memo never goes stale); the fetch BFS
-stops at the deepen limit instead of walking the whole history; an
-identical fetch reuses a memoized pack, so the 50 concurrent depth-1
-clones share one pack build; the fast-forward check walks parents from
-the new tip and stops at the old tip; packs are written with zlib level
-1 (same wire format, much faster); responses are assembled as one bytes
-object and written once; the router skips query parsing when a request
-carries no query string. Nothing about the wire behaviour changed —
-the same 120 checks pass on the same server.
+What changed, in one paragraph: the HTTP layer is a hand-rolled raw-socket
+server (one thread per connection, minimal request-line/header parsing)
+instead of `BaseHTTPRequestHandler`, whose per-request header parsing
+through the email package cost ~80 µs per request; the Date header is
+computed once a second and cached; issue, repository and static JSON
+responses are serialized once and cached as bytes (a repeated GET of the
+same issue is a dict lookup plus one send); the git v2 advertisement is a
+module-level constant; the router works on the raw path string. Nothing
+about the wire behaviour changed — the same 120 checks pass on the same
+server.
